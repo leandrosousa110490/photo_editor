@@ -1,0 +1,5 @@
+PyQt5==5.15.9
+Pillow==9.5.0
+rembg==2.0.50
+numpy==1.24.3
+torch>=1.7.0

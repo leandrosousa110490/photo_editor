@@ -3,3 +3,6 @@ Pillow==9.5.0
 rembg==2.0.50
 numpy==1.24.3
 torch>=1.7.0
+svglib>=1.5.1  # For SVG operations (replaces cairocffi)
+reportlab>=3.6.12  # Required by svglib
+base64io>=1.0.3  # For SVG embedding

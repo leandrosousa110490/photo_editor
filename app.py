@@ -13,6 +13,8 @@ import logging
 import importlib
 import site
 import traceback
+import io
+import base64  # For SVG encoding
 
 # Set up logging
 logging.basicConfig(
@@ -21,6 +23,37 @@ logging.basicConfig(
     filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'image_editor.log')
 )
 logger = logging.getLogger('ImageEditor')
+
+# Global variables for optional modules
+REMBG_AVAILABLE = False
+SVGLIB_AVAILABLE = False
+
+# Function to check for svglib
+def initialize_svglib():
+    global SVGLIB_AVAILABLE
+    try:
+        # Check if the module exists without importing it first
+        if importlib.util.find_spec('svglib') is None:
+            logger.warning("svglib package not found in system path")
+            return False
+            
+        # Try importing
+        logger.info("Attempting to import svglib module")
+        import svglib.svglib
+        from reportlab.graphics import renderPM
+        
+        # Log the path where svglib was found
+        svglib_path = sys.modules['svglib'].__file__
+        logger.info(f"svglib successfully imported from: {svglib_path}")
+        SVGLIB_AVAILABLE = True
+        return True
+    except ImportError as e:
+        logger.error(f"ImportError for svglib: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error loading svglib: {str(e)}")
+        logger.error(traceback.format_exc())
+        return False
 
 # Function to check for rembg and initialize it
 def initialize_rembg():
@@ -64,9 +97,11 @@ def initialize_rembg():
         logger.error(traceback.format_exc())
         return False
 
-# Initial check for rembg
+# Initial check for optional libraries
 REMBG_AVAILABLE = False
+SVGLIB_AVAILABLE = False
 initialize_rembg()
+initialize_svglib()
 
 class TransparentBackgroundLabel(QLabel):
     """Custom QLabel that shows a checkered background for transparent images."""
@@ -352,7 +387,8 @@ class ImageEditorApp(QMainWindow):
         
         format_layout.addWidget(QLabel("Output Format:"))
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["JPEG", "PNG", "BMP", "TIFF", "GIF", "WEBP"])
+        self.format_combo.addItems(["JPEG", "PNG", "BMP", "TIFF", "GIF", "WEBP", "ICO", "SVG"])
+        self.format_combo.currentTextChanged.connect(self.format_changed)
         format_layout.addWidget(self.format_combo)
         
         # Background removal option
@@ -368,6 +404,67 @@ class ImageEditorApp(QMainWindow):
             "color: #00AA00; font-weight: bold;" if REMBG_AVAILABLE else "color: #FF5500; font-weight: bold;"
         )
         format_layout.addWidget(self.rembg_status_label)
+        
+        # Icon size options (for ICO format)
+        self.ico_options_group = QGroupBox("Icon Options")
+        self.ico_options_layout = QVBoxLayout(self.ico_options_group)
+        
+        # Size selection for icons
+        self.ico_options_layout.addWidget(QLabel("Icon Sizes:"))
+        self.ico_sizes_layout = QHBoxLayout()
+        
+        # Checkboxes for common icon sizes
+        self.size_16 = QCheckBox("16×16")
+        self.size_16.setChecked(True)
+        self.size_32 = QCheckBox("32×32") 
+        self.size_32.setChecked(True)
+        self.size_48 = QCheckBox("48×48")
+        self.size_64 = QCheckBox("64×64")
+        self.size_128 = QCheckBox("128×128")
+        self.size_256 = QCheckBox("256×256")
+        
+        self.ico_sizes_layout.addWidget(self.size_16)
+        self.ico_sizes_layout.addWidget(self.size_32)
+        self.ico_sizes_layout.addWidget(self.size_48)
+        self.ico_sizes_layout.addWidget(self.size_64)
+        self.ico_sizes_layout.addWidget(self.size_128)
+        self.ico_sizes_layout.addWidget(self.size_256)
+        
+        self.ico_options_layout.addLayout(self.ico_sizes_layout)
+        format_layout.addWidget(self.ico_options_group)
+        self.ico_options_group.setVisible(False)
+        
+        # SVG Options
+        self.svg_options_group = QGroupBox("SVG Options")
+        self.svg_options_layout = QVBoxLayout(self.svg_options_group)
+        
+        # Quality option for SVG export
+        self.svg_options_layout.addWidget(QLabel("Image Quality for SVG:"))
+        quality_layout = QHBoxLayout()
+        self.svg_quality_slider = QSlider(Qt.Horizontal)
+        self.svg_quality_slider.setRange(1, 100)
+        self.svg_quality_slider.setValue(85)
+        self.svg_quality_slider.setTickPosition(QSlider.TicksBelow)
+        quality_layout.addWidget(self.svg_quality_slider)
+        self.svg_quality_value = QLabel("85%")
+        quality_layout.addWidget(self.svg_quality_value)
+        self.svg_options_layout.addLayout(quality_layout)
+        self.svg_quality_slider.valueChanged.connect(self.update_svg_quality_label)
+        
+        # Add a status indicator for svglib
+        self.svglib_status_label = QLabel(f"SVG Library: {'Available' if SVGLIB_AVAILABLE else 'Not Available'}")
+        self.svglib_status_label.setStyleSheet(
+            "color: #00AA00; font-weight: bold;" if SVGLIB_AVAILABLE else "color: #FF5500; font-weight: bold;"
+        )
+        self.svg_options_layout.addWidget(self.svglib_status_label)
+        
+        # Add button to install SVG dependencies
+        self.install_svg_deps_btn = QPushButton("Install SVG Dependencies")
+        self.install_svg_deps_btn.clicked.connect(self.install_svg_dependencies)
+        self.svg_options_layout.addWidget(self.install_svg_deps_btn)
+        
+        format_layout.addWidget(self.svg_options_group)
+        self.svg_options_group.setVisible(False)
         
         # Quality slider for JPEG
         quality_layout = QHBoxLayout()
@@ -721,6 +818,10 @@ class ImageEditorApp(QMainWindow):
     def update_quality_label(self):
         self.quality_value.setText(f"{self.quality_slider.value()}%")
     
+    def update_svg_quality_label(self):
+        """Update the SVG quality slider value label."""
+        self.svg_quality_value.setText(f"{self.svg_quality_slider.value()}%")
+    
     def apply_background_removal(self, img):
         """Prepare for background removal using the background removal thread."""
         if not REMBG_AVAILABLE or not self.remove_bg_check.isChecked():
@@ -845,7 +946,9 @@ class ImageEditorApp(QMainWindow):
             "BMP": ".bmp",
             "TIFF": ".tiff",
             "GIF": ".gif",
-            "WEBP": ".webp"
+            "WEBP": ".webp",
+            "ICO": ".ico",
+            "SVG": ".svg"
         }
         
         selected_format = self.format_combo.currentText()
@@ -884,20 +987,41 @@ class ImageEditorApp(QMainWindow):
             img_to_save = img_to_save.resize(new_size, Image.Resampling.LANCZOS)
             self.progress_bar.setValue(40)
             
-            # Apply background removal if selected
-            if self.remove_bg_check.isChecked() and REMBG_AVAILABLE:
+            # Apply background removal if selected and format supports it
+            if self.remove_bg_check.isChecked() and REMBG_AVAILABLE and selected_format != "SVG":
                 self.statusBar().showMessage('Removing background...')
                 img_to_save = self.apply_background_removal(img_to_save)
                 self.statusBar().showMessage('Background removed')
             self.progress_bar.setValue(80)
             
-            # Save with appropriate format and quality
+            # Save with appropriate format and options
             if selected_format == "JPEG":
                 # JPEG doesn't support alpha, use white background
                 if img_to_save.mode == 'RGBA':
                     white_bg = Image.new('RGBA', img_to_save.size, (255, 255, 255, 255))
                     img_to_save = Image.alpha_composite(white_bg, img_to_save).convert('RGB')
                 img_to_save.save(file_path, quality=self.quality_slider.value())
+                
+            elif selected_format == "ICO":
+                # Create a list of sizes for the icon
+                sizes = []
+                if self.size_16.isChecked(): sizes.append((16, 16))
+                if self.size_32.isChecked(): sizes.append((32, 32))
+                if self.size_48.isChecked(): sizes.append((48, 48))
+                if self.size_64.isChecked(): sizes.append((64, 64))
+                if self.size_128.isChecked(): sizes.append((128, 128))
+                if self.size_256.isChecked(): sizes.append((256, 256))
+                
+                if not sizes:  # If no sizes selected, use default
+                    sizes = [(32, 32)]
+                
+                # Create images for each size
+                img_to_save.save(file_path, format="ICO", sizes=sizes)
+                
+            elif selected_format == "SVG":
+                # Use direct conversion with the specified quality
+                self.save_as_svg_direct(img_to_save, file_path, self.svg_quality_slider.value())
+                
             else:
                 img_to_save.save(file_path)
             
@@ -911,7 +1035,48 @@ class ImageEditorApp(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to save image: {str(e)}")
             import traceback
             traceback.print_exc()
+    
+    def save_as_svg_direct(self, img, file_path, quality=85):
+        """Convert image to SVG using direct embedding."""
+        try:
+            # Convert the image to PNG in memory with the specified quality
+            png_buffer = io.BytesIO()
+            img.save(png_buffer, format="PNG", quality=quality)
+            png_data = png_buffer.getvalue()
+            
+            # Create the SVG with embedded PNG
+            width, height = img.size
+            svg = f'''<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+            <svg xmlns="http://www.w3.org/2000/svg" 
+                 xmlns:xlink="http://www.w3.org/1999/xlink" 
+                 width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+                <image width="{width}" height="{height}" 
+                       xlink:href="data:image/png;base64,{base64.b64encode(png_data).decode('ascii')}"/>
+            </svg>'''
+            
+            # Write SVG to file
+            with open(file_path, 'w') as f:
+                f.write(svg)
+        except Exception as e:
+            logger.error(f"SVG conversion error: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise e
 
+    def format_changed(self, format_name):
+        """Handle changes to the output format selection."""
+        # Show/hide format-specific options
+        self.ico_options_group.setVisible(format_name == "ICO")
+        self.svg_options_group.setVisible(format_name == "SVG")
+        
+        # Disable background removal for SVG (not compatible)
+        if format_name == "SVG":
+            self.remove_bg_check.setEnabled(False)
+            self.remove_bg_check.setChecked(False)
+            self.remove_bg_check.setToolTip("Background removal is not compatible with SVG format")
+        else:
+            self.remove_bg_check.setEnabled(REMBG_AVAILABLE)
+            self.remove_bg_check.setToolTip(f"Background removal: {'Available' if REMBG_AVAILABLE else 'Not Available'}")
+    
     def closeEvent(self, event):
         """Clean up temporary files when closing the application."""
         try:
@@ -925,6 +1090,102 @@ class ImageEditorApp(QMainWindow):
             pass
         logger.info("Application closed")
         super().closeEvent(event)
+
+    def install_svg_dependencies(self):
+        """Install the svglib package using pip."""
+        try:
+            self.statusBar().showMessage('Installing SVG dependencies...')
+            
+            # Create a message box with progress information
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Installing SVG Dependencies")
+            msg.setText("Installing SVG conversion libraries...\n\nThis might take a few minutes.")
+            msg.setDetailedText("This will install:\n- svglib (for SVG rendering)\n- reportlab (required by svglib)")
+            msg.setStandardButtons(QMessageBox.NoButton)
+            msg.show()
+            QApplication.processEvents()
+            
+            # Get Python executable path and pip paths
+            python_exe = sys.executable
+            scripts_dir = os.path.join(os.path.dirname(python_exe), 'Scripts')
+            pip_path = os.path.join(scripts_dir, 'pip.exe') if os.name == 'nt' else os.path.join(scripts_dir, 'pip')
+            if not os.path.exists(pip_path):
+                pip_path = python_exe
+                pip_args = ["-m", "pip"]
+            else:
+                pip_args = []
+            
+            # Log installation information
+            logger.info(f"Using Python: {python_exe}")
+            logger.info(f"Using pip: {pip_path}")
+            
+            # Install packages
+            packages = []
+            
+            # Check if svglib is already installed
+            if importlib.util.find_spec('svglib') is None:
+                packages.append("svglib")
+                packages.append("reportlab")  # Required dependency for svglib
+            
+            # If nothing to install
+            if not packages:
+                msg.close()
+                QMessageBox.information(self, "Already Installed", 
+                                      "All SVG dependencies are already installed.")
+                self.statusBar().showMessage('All dependencies already installed')
+                return
+                
+            # Install the packages
+            install_args = [pip_path] + pip_args + ["install", "--upgrade"] + packages
+            logger.info(f"Install command: {' '.join(install_args)}")
+            
+            result = subprocess.run(install_args, capture_output=True, text=True)
+            
+            # Log installation result
+            logger.info(f"Installation return code: {result.returncode}")
+            logger.info(f"Installation stdout: {result.stdout}")
+            if result.stderr:
+                logger.warning(f"Installation stderr: {result.stderr}")
+            
+            msg.close()
+            
+            # Check if installation was successful
+            if result.returncode == 0:
+                # Check if svglib was installed
+                global SVGLIB_AVAILABLE
+                was_svglib_available = SVGLIB_AVAILABLE
+                initialize_svglib()
+                
+                # Update the status label
+                self.svglib_status_label.setText(f"SVG Library: {'Available' if SVGLIB_AVAILABLE else 'Not Available'}")
+                self.svglib_status_label.setStyleSheet(
+                    "color: #00AA00; font-weight: bold;" if SVGLIB_AVAILABLE else "color: #FF5500; font-weight: bold;"
+                )
+                
+                # Show a success message
+                if SVGLIB_AVAILABLE:
+                    QMessageBox.information(
+                        self, "Success", 
+                        "SVG dependencies have been installed successfully and are now available for use."
+                    )
+                else:
+                    QMessageBox.warning(
+                        self, "Installation Issue", 
+                        "SVG libraries were installed but are still not detected.\n\n"
+                        "Please try installing them manually with 'pip install svglib reportlab'."
+                    )
+            else:
+                error_msg = f"Error installing SVG dependencies:\n\n{result.stderr}"
+                QMessageBox.critical(self, "Installation Error", error_msg)
+                logger.error(error_msg)
+                
+            self.statusBar().showMessage('Ready')
+        except Exception as e:
+            QMessageBox.critical(self, "Installation Error", 
+                               f"Failed to install SVG dependencies: {str(e)}\n\nCheck the log file for details.")
+            logger.error(f"Installation error: {str(e)}")
+            logger.error(traceback.format_exc())
 
 def main():
     app = QApplication(sys.argv)

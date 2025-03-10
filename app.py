@@ -9,20 +9,28 @@ from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QRect
 from PIL import Image, ImageQt
 import numpy as np
 import subprocess
-import logging
 import importlib
 import site
 import traceback
 import io
 import base64  # For SVG encoding
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'image_editor.log')
-)
-logger = logging.getLogger('ImageEditor')
+# Dummy logger that does nothing
+class DummyLogger:
+    def __init__(self, *args, **kwargs):
+        pass
+    
+    def info(self, *args, **kwargs):
+        pass
+    
+    def warning(self, *args, **kwargs):
+        pass
+    
+    def error(self, *args, **kwargs):
+        pass
+
+# Replace logger with dummy logger that does nothing
+logger = DummyLogger()
 
 # Global variables for optional modules
 REMBG_AVAILABLE = False

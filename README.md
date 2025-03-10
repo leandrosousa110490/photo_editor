@@ -50,6 +50,3 @@ If you encounter issues with background removal:
 - **Session creation error**: Could mean the model files are missing or corrupted
 - **Memory errors**: Large images may require more RAM than available
 - **CUDA errors**: GPU acceleration requires proper NVIDIA drivers
-
-For detailed logs, check the `image_editor.log` file in the application directory.
-

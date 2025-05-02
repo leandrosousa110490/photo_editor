@@ -3,10 +3,11 @@ import os
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton, 
                            QVBoxLayout, QHBoxLayout, QWidget, QFileDialog,
                            QSpinBox, QComboBox, QSlider, QMessageBox, QGroupBox,
-                           QSizePolicy, QProgressBar, QCheckBox, QToolBar, QAction)
+                           QSizePolicy, QProgressBar, QCheckBox, QToolBar, QAction,
+                           QTabWidget)
 from PyQt5.QtGui import QPixmap, QImage, QPalette, QColor, QIcon, QPainter, QBrush, QKeySequence
 from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QRect
-from PIL import Image, ImageQt
+from PIL import Image, ImageQt, ImageEnhance, ImageOps, ImageFilter
 import numpy as np
 import subprocess
 import importlib
@@ -14,6 +15,7 @@ import site
 import traceback
 import io
 import base64  # For SVG encoding
+import colorsys  # For HSV/RGB conversion
 
 # Dummy logger that does nothing
 class DummyLogger:
@@ -147,7 +149,7 @@ class TransparentBackgroundLabel(QLabel):
         super().paintEvent(event)
 
 class ZoomableImageLabel(TransparentBackgroundLabel):
-    """Extended QLabel that supports zooming and panning."""
+    """Extended QLabel that supports zooming, panning, and selection for cropping."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.original_pixmap = None
@@ -164,6 +166,12 @@ class ZoomableImageLabel(TransparentBackgroundLabel):
         self.pan_offset_x = 0
         self.pan_offset_y = 0
         
+        # For crop selection
+        self.cropping_enabled = False
+        self.crop_start = None
+        self.crop_end = None
+        self.selecting = False
+        
         # Enable mouse tracking
         self.setMouseTracking(True)
         
@@ -178,6 +186,9 @@ class ZoomableImageLabel(TransparentBackgroundLabel):
             self.zoom_factor = 1.0
             self.pan_offset_x = 0
             self.pan_offset_y = 0
+            # Reset crop selection when loading a new image
+            self.crop_start = None
+            self.crop_end = None
             self.update_display()
         else:
             super().setPixmap(pixmap)
@@ -203,10 +214,59 @@ class ZoomableImageLabel(TransparentBackgroundLabel):
     
     def update_cursor(self):
         """Update cursor based on current state."""
-        if self.panning:
+        if self.cropping_enabled:
+            self.setCursor(Qt.CrossCursor)  # Crosshair cursor for cropping
+        elif self.panning:
             self.setCursor(Qt.ClosedHandCursor)  # Grabbing hand
         else:
             self.setCursor(Qt.OpenHandCursor)    # Hand for panning
+    
+    def enable_cropping(self, enabled):
+        """Enable or disable crop selection mode."""
+        self.cropping_enabled = enabled
+        self.crop_start = None
+        self.crop_end = None
+        self.update_cursor()
+        self.update()
+    
+    def get_crop_rect(self):
+        """Get the crop rectangle in original image coordinates."""
+        if not self.crop_start or not self.crop_end or not self.original_pixmap:
+            return None
+            
+        # Get the image display area
+        img_rect = self.get_scaled_image_rect()
+        
+        # Convert from screen coordinates to image coordinates
+        x1 = (self.crop_start.x() - img_rect.x()) / self.zoom_factor
+        y1 = (self.crop_start.y() - img_rect.y()) / self.zoom_factor
+        x2 = (self.crop_end.x() - img_rect.x()) / self.zoom_factor
+        y2 = (self.crop_end.y() - img_rect.y()) / self.zoom_factor
+        
+        # Ensure values are in bounds of the original image
+        x1 = max(0, min(x1, self.original_pixmap.width()))
+        y1 = max(0, min(y1, self.original_pixmap.height()))
+        x2 = max(0, min(x2, self.original_pixmap.width()))
+        y2 = max(0, min(y2, self.original_pixmap.height()))
+        
+        # Normalize coordinates (ensure top-left to bottom-right order)
+        left = min(x1, x2)
+        top = min(y1, y2)
+        right = max(x1, x2)
+        bottom = max(y1, y2)
+        
+        return QRect(int(left), int(top), int(right-left), int(bottom-top))
+    
+    def get_scaled_image_rect(self):
+        """Get the rectangle where the image is displayed within the label."""
+        if not self.current_pixmap or self.current_pixmap.isNull():
+            return QRect()
+            
+        # Calculate position to center the image in the view
+        x = (self.width() - self.current_pixmap.width()) / 2 + self.pan_offset_x
+        y = (self.height() - self.current_pixmap.height()) / 2 + self.pan_offset_y
+        
+        return QRect(int(x), int(y), self.current_pixmap.width(), self.current_pixmap.height())
     
     def zoom_in(self):
         """Zoom in by one step."""
@@ -257,17 +317,33 @@ class ZoomableImageLabel(TransparentBackgroundLabel):
                 self.zoom_out()
     
     def mousePressEvent(self, event):
-        """Handle mouse press for panning."""
-        if event.button() == Qt.LeftButton:
-            # Allow panning at any zoom level (not just when zoomed in)
+        """Handle mouse press for panning or cropping."""
+        if not self.current_pixmap or self.current_pixmap.isNull():
+            return
+            
+        if self.cropping_enabled and event.button() == Qt.LeftButton:
+            # Start crop selection
+            self.selecting = True
+            self.crop_start = event.pos()
+            self.crop_end = event.pos()  # Initialize end with same point
+            self.update()
+        elif event.button() == Qt.LeftButton and not self.cropping_enabled:
+            # Start panning
             self.panning = True
             self.pan_start_x = event.x()
             self.pan_start_y = event.y()
             self.update_cursor()
     
     def mouseMoveEvent(self, event):
-        """Handle mouse move for panning."""
-        if self.panning:
+        """Handle mouse move for panning or crop selection."""
+        if not self.current_pixmap or self.current_pixmap.isNull():
+            return
+            
+        if self.selecting and self.cropping_enabled:
+            # Update crop selection end point
+            self.crop_end = event.pos()
+            self.update()
+        elif self.panning:
             # Calculate movement delta
             delta_x = event.x() - self.pan_start_x
             delta_y = event.y() - self.pan_start_y
@@ -284,13 +360,20 @@ class ZoomableImageLabel(TransparentBackgroundLabel):
             self.update()
     
     def mouseReleaseEvent(self, event):
-        """Handle mouse release to end panning."""
-        if event.button() == Qt.LeftButton and self.panning:
-            self.panning = False
-            self.update_cursor()
+        """Handle mouse release to end panning or cropping."""
+        if event.button() == Qt.LeftButton:
+            if self.selecting and self.cropping_enabled:
+                # Finalize crop selection
+                self.crop_end = event.pos()
+                self.selecting = False
+                self.update()
+            elif self.panning:
+                # End panning
+                self.panning = False
+                self.update_cursor()
     
     def paintEvent(self, event):
-        """Custom paint event to handle panning."""
+        """Custom paint event to handle panning and crop selection overlay."""
         if self.current_pixmap and not self.current_pixmap.isNull():
             painter = QPainter(self)
             
@@ -318,6 +401,44 @@ class ZoomableImageLabel(TransparentBackgroundLabel):
             
             # Draw the pixmap with panning offset
             painter.drawPixmap(int(x), int(y), self.current_pixmap)
+            
+            # Draw crop selection rectangle if in crop mode and selection exists
+            if self.cropping_enabled and self.crop_start and self.crop_end:
+                # Create selection rectangle
+                rect = QRect(self.crop_start, self.crop_end).normalized()
+                
+                # Draw semi-transparent overlay for non-selected area
+                overlay_color = QColor(0, 0, 0, 120)  # Semi-transparent black
+                
+                # Top rectangle
+                painter.fillRect(QRect(0, 0, self.width(), rect.top()), overlay_color)
+                # Bottom rectangle
+                painter.fillRect(QRect(0, rect.bottom() + 1, self.width(), self.height() - rect.bottom() - 1), overlay_color)
+                # Left rectangle
+                painter.fillRect(QRect(0, rect.top(), rect.left(), rect.height()), overlay_color)
+                # Right rectangle
+                painter.fillRect(QRect(rect.right() + 1, rect.top(), self.width() - rect.right() - 1, rect.height()), overlay_color)
+                
+                # Draw border around selected area
+                pen = painter.pen()
+                pen.setColor(Qt.white)
+                pen.setWidth(2)
+                painter.setPen(pen)
+                painter.drawRect(rect)
+                
+                # Draw selection dimensions 
+                text = f"{rect.width()} x {rect.height()}"
+                text_rect = painter.fontMetrics().boundingRect(text)
+                
+                # Position text at bottom-right of selection
+                text_x = rect.right() - text_rect.width() - 5
+                text_y = rect.bottom() - 5
+                
+                # Draw text with shadow
+                painter.setPen(Qt.black)
+                painter.drawText(text_x + 1, text_y + 1, text)
+                painter.setPen(Qt.white)
+                painter.drawText(text_x, text_y, text)
         else:
             # Fall back to default paint behavior for normal display
             super().paintEvent(event)
@@ -401,6 +522,13 @@ class ImageEditorApp(QMainWindow):
         self.setWindowTitle("Image Editor with Background Removal")
         self.setMinimumSize(1000, 600)
         
+        # Create main image display label
+        self.image_label = ZoomableImageLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.image_label.setMinimumSize(400, 300)
+        self.image_label.setText("Drag & drop an image here or use Open button")
+        
         # Create toolbar
         self.toolbar = QToolBar("Main Toolbar")
         self.addToolBar(self.toolbar)
@@ -457,6 +585,352 @@ class ImageEditorApp(QMainWindow):
         # Add separator in toolbar
         self.toolbar.addSeparator()
         
+        # Create central widget and layouts
+        central_widget = QWidget()
+        main_layout = QVBoxLayout(central_widget)
+        
+        # Create tab widget for organizing controls
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setMaximumHeight(250)  # Limit height to give more space to canvas
+        
+        # Create tabs for different functionality groups
+        resize_tab = QWidget()
+        adjustments_tab = QWidget()
+        transform_tab = QWidget()
+        effects_tab = QWidget()
+        
+        # Setup resize tab
+        resize_layout = QVBoxLayout(resize_tab)
+        
+        # Create horizontal layout for size controls
+        size_layout = QHBoxLayout()
+        
+        width_layout = QHBoxLayout()
+        width_layout.addWidget(QLabel("Width:"))
+        self.width_spin = QSpinBox()
+        self.width_spin.setMinimum(1)
+        self.width_spin.setMaximum(10000)
+        self.width_spin.setValue(800)
+        self.width_spin.valueChanged.connect(self.update_height_maintain_ratio)
+        width_layout.addWidget(self.width_spin)
+        size_layout.addLayout(width_layout)
+        
+        height_layout = QHBoxLayout()
+        height_layout.addWidget(QLabel("Height:"))
+        self.height_spin = QSpinBox()
+        self.height_spin.setMinimum(1)
+        self.height_spin.setMaximum(10000)
+        self.height_spin.setValue(600)
+        self.height_spin.valueChanged.connect(self.update_width_maintain_ratio)
+        height_layout.addWidget(self.height_spin)
+        size_layout.addLayout(height_layout)
+        
+        resize_layout.addLayout(size_layout)
+        
+        # Add maintain aspect ratio checkbox
+        self.maintain_ratio = False
+        ratio_layout = QHBoxLayout()
+        self.ratio_btn = QCheckBox("Maintain Ratio: OFF")
+        self.ratio_btn.clicked.connect(self.toggle_aspect_ratio)
+        ratio_layout.addWidget(self.ratio_btn)
+        resize_layout.addLayout(ratio_layout)
+        
+        # Add preview button
+        preview_layout = QHBoxLayout()
+        preview_btn = QPushButton("Apply Changes")
+        preview_btn.setShortcut(QKeySequence("Ctrl+P"))
+        preview_btn.clicked.connect(self.preview_changes)
+        preview_layout.addWidget(preview_btn)
+        resize_layout.addLayout(preview_layout)
+        
+        # Add output format selection
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(QLabel("Output Format:"))
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["PNG", "JPEG", "SVG"])
+        self.format_combo.currentTextChanged.connect(self.format_changed)
+        format_layout.addWidget(self.format_combo)
+        resize_layout.addLayout(format_layout)
+        
+        # Quality slider for JPEG
+        quality_layout = QHBoxLayout()
+        quality_layout.addWidget(QLabel("JPEG Quality:"))
+        self.quality_slider = QSlider(Qt.Horizontal)
+        self.quality_slider.setMinimum(10)
+        self.quality_slider.setMaximum(100)
+        self.quality_slider.setValue(85)
+        self.quality_slider.valueChanged.connect(self.update_quality_label)
+        quality_layout.addWidget(self.quality_slider)
+        self.quality_value = QLabel("85%")
+        quality_layout.addWidget(self.quality_value)
+        resize_layout.addLayout(quality_layout)
+        
+        # SVG options
+        self.svg_options_group = QGroupBox("SVG Options")
+        svg_options_layout = QVBoxLayout()
+        
+        svg_quality_layout = QHBoxLayout()
+        svg_quality_layout.addWidget(QLabel("SVG Quality:"))
+        self.svg_quality_slider = QSlider(Qt.Horizontal)
+        self.svg_quality_slider.setMinimum(10)
+        self.svg_quality_slider.setMaximum(100)
+        self.svg_quality_slider.setValue(90)
+        self.svg_quality_slider.valueChanged.connect(self.update_svg_quality_label)
+        svg_quality_layout.addWidget(self.svg_quality_slider)
+        self.svg_quality_value = QLabel("90%")
+        svg_quality_layout.addWidget(self.svg_quality_value)
+        svg_options_layout.addLayout(svg_quality_layout)
+        
+        # Install SVG support button
+        self.svglib_status_label = QLabel("SVG Library: Not Available")
+        self.svglib_status_label.setStyleSheet("color: #FF5500; font-weight: bold;")
+        svg_options_layout.addWidget(self.svglib_status_label)
+        
+        install_svg_btn = QPushButton("Install SVG Support")
+        install_svg_btn.clicked.connect(self.install_svg_dependencies)
+        svg_options_layout.addWidget(install_svg_btn)
+        
+        self.svg_options_group.setLayout(svg_options_layout)
+        resize_layout.addWidget(self.svg_options_group)
+        self.svg_options_group.setVisible(False)
+        
+        # ICO options
+        self.ico_options_group = QGroupBox("ICO Options")
+        ico_options_layout = QVBoxLayout()
+        
+        ico_sizes_layout = QHBoxLayout()
+        ico_sizes_layout.addWidget(QLabel("Sizes:"))
+        self.ico_sizes = QCheckBox("Include multiple sizes")
+        self.ico_sizes.setChecked(True)
+        ico_sizes_layout.addWidget(self.ico_sizes)
+        ico_options_layout.addLayout(ico_sizes_layout)
+        
+        self.ico_options_group.setLayout(ico_options_layout)
+        resize_layout.addWidget(self.ico_options_group)
+        self.ico_options_group.setVisible(False)
+        
+        # Setup adjustments tab
+        adjustments_layout = QVBoxLayout(adjustments_tab)
+        
+        # Create a horizontal layout for the sliders
+        sliders_layout = QHBoxLayout()
+        
+        # Left group - Basic adjustments
+        basic_adj_layout = QVBoxLayout()
+        
+        # Brightness adjustment
+        brightness_layout = QHBoxLayout()
+        brightness_layout.addWidget(QLabel("Brightness:"))
+        self.brightness_slider = QSlider(Qt.Horizontal)
+        self.brightness_slider.setMinimum(-100)
+        self.brightness_slider.setMaximum(100)
+        self.brightness_slider.setValue(0)
+        brightness_layout.addWidget(self.brightness_slider)
+        basic_adj_layout.addLayout(brightness_layout)
+        
+        # Contrast adjustment
+        contrast_layout = QHBoxLayout()
+        contrast_layout.addWidget(QLabel("Contrast:"))
+        self.contrast_slider = QSlider(Qt.Horizontal)
+        self.contrast_slider.setMinimum(-100)
+        self.contrast_slider.setMaximum(100)
+        self.contrast_slider.setValue(0)
+        contrast_layout.addWidget(self.contrast_slider)
+        basic_adj_layout.addLayout(contrast_layout)
+        
+        # Saturation adjustment
+        saturation_layout = QHBoxLayout()
+        saturation_layout.addWidget(QLabel("Saturation:"))
+        self.saturation_slider = QSlider(Qt.Horizontal)
+        self.saturation_slider.setMinimum(-100)
+        self.saturation_slider.setMaximum(100)
+        self.saturation_slider.setValue(0)
+        saturation_layout.addWidget(self.saturation_slider)
+        basic_adj_layout.addLayout(saturation_layout)
+        
+        # Hue adjustment
+        hue_layout = QHBoxLayout()
+        hue_layout.addWidget(QLabel("Hue:"))
+        self.hue_slider = QSlider(Qt.Horizontal)
+        self.hue_slider.setMinimum(-180)
+        self.hue_slider.setMaximum(180)
+        self.hue_slider.setValue(0)
+        hue_layout.addWidget(self.hue_slider)
+        basic_adj_layout.addLayout(hue_layout)
+        
+        sliders_layout.addLayout(basic_adj_layout)
+        
+        # Right group - RGB Channels
+        rgb_adj_layout = QVBoxLayout()
+        
+        rgb_label = QLabel("RGB Channels:")
+        rgb_adj_layout.addWidget(rgb_label)
+        
+        # Red channel
+        red_layout = QHBoxLayout()
+        red_layout.addWidget(QLabel("Red:"))
+        self.red_slider = QSlider(Qt.Horizontal)
+        self.red_slider.setMinimum(-100)
+        self.red_slider.setMaximum(100)
+        self.red_slider.setValue(0)
+        red_layout.addWidget(self.red_slider)
+        rgb_adj_layout.addLayout(red_layout)
+        
+        # Green channel
+        green_layout = QHBoxLayout()
+        green_layout.addWidget(QLabel("Green:"))
+        self.green_slider = QSlider(Qt.Horizontal)
+        self.green_slider.setMinimum(-100)
+        self.green_slider.setMaximum(100)
+        self.green_slider.setValue(0)
+        green_layout.addWidget(self.green_slider)
+        rgb_adj_layout.addLayout(green_layout)
+        
+        # Blue channel
+        blue_layout = QHBoxLayout()
+        blue_layout.addWidget(QLabel("Blue:"))
+        self.blue_slider = QSlider(Qt.Horizontal)
+        self.blue_slider.setMinimum(-100)
+        self.blue_slider.setMaximum(100)
+        self.blue_slider.setValue(0)
+        blue_layout.addWidget(self.blue_slider)
+        rgb_adj_layout.addLayout(blue_layout)
+        
+        sliders_layout.addLayout(rgb_adj_layout)
+        adjustments_layout.addLayout(sliders_layout)
+        
+        # Add apply and reset buttons
+        adj_buttons_layout = QHBoxLayout()
+        apply_adj_btn = QPushButton("Apply Adjustments")
+        apply_adj_btn.clicked.connect(self.apply_image_adjustments)
+        adj_buttons_layout.addWidget(apply_adj_btn)
+        
+        reset_adj_btn = QPushButton("Reset Sliders")
+        reset_adj_btn.clicked.connect(self.reset_image_adjustments)
+        adj_buttons_layout.addWidget(reset_adj_btn)
+        
+        reset_original_btn = QPushButton("Reset to Original")
+        reset_original_btn.clicked.connect(self.reset_to_original)
+        adj_buttons_layout.addWidget(reset_original_btn)
+        
+        adjustments_layout.addLayout(adj_buttons_layout)
+        
+        # Setup transform tab
+        transform_layout = QVBoxLayout(transform_tab)
+        
+        # Rotation controls
+        rotation_layout = QHBoxLayout()
+        rotation_layout.addWidget(QLabel("Rotation:"))
+        
+        rotate_left_btn = QPushButton("↺ 90°")
+        rotate_left_btn.clicked.connect(lambda: self.rotate_image(90))
+        rotation_layout.addWidget(rotate_left_btn)
+        
+        rotate_180_btn = QPushButton("↻ 180°")
+        rotate_180_btn.clicked.connect(lambda: self.rotate_image(180))
+        rotation_layout.addWidget(rotate_180_btn)
+        
+        rotate_right_btn = QPushButton("↻ 90°")
+        rotate_right_btn.clicked.connect(lambda: self.rotate_image(-90))
+        rotation_layout.addWidget(rotate_right_btn)
+        
+        transform_layout.addLayout(rotation_layout)
+        
+        # Fine rotation controls
+        fine_rotation_layout = QHBoxLayout()
+        fine_rotation_layout.addWidget(QLabel("Fine Rotation:"))
+        
+        rotate_fine_left_btn = QPushButton("↺ 5°")
+        rotate_fine_left_btn.clicked.connect(lambda: self.rotate_image_fine(5))
+        fine_rotation_layout.addWidget(rotate_fine_left_btn)
+        
+        rotate_fine_right_btn = QPushButton("↻ 5°")
+        rotate_fine_right_btn.clicked.connect(lambda: self.rotate_image_fine(-5))
+        fine_rotation_layout.addWidget(rotate_fine_right_btn)
+        
+        transform_layout.addLayout(fine_rotation_layout)
+        
+        # Flip controls
+        flip_layout = QHBoxLayout()
+        flip_layout.addWidget(QLabel("Flip:"))
+        
+        flip_h_btn = QPushButton("↔ Horizontal")
+        flip_h_btn.clicked.connect(lambda: self.flip_image("horizontal"))
+        flip_layout.addWidget(flip_h_btn)
+        
+        flip_v_btn = QPushButton("↕ Vertical")
+        flip_v_btn.clicked.connect(lambda: self.flip_image("vertical"))
+        flip_layout.addWidget(flip_v_btn)
+        
+        transform_layout.addLayout(flip_layout)
+        
+        # Setup effects tab
+        effects_layout = QVBoxLayout(effects_tab)
+        
+        # Background removal option
+        bg_layout = QHBoxLayout()
+        self.remove_bg_check = QCheckBox("Remove Background")
+        self.remove_bg_check.setEnabled(REMBG_AVAILABLE)
+        self.remove_bg_check.setShortcut(QKeySequence("Ctrl+B"))
+        bg_layout.addWidget(self.remove_bg_check)
+        
+        # Add background removal status
+        self.rembg_status_label = QLabel(f"Status: {'Available' if REMBG_AVAILABLE else 'Not Available'}")
+        self.rembg_status_label.setStyleSheet(
+            "color: #00AA00;" if REMBG_AVAILABLE else "color: #FF5500;"
+        )
+        bg_layout.addWidget(self.rembg_status_label)
+        
+        effects_layout.addLayout(bg_layout)
+        
+        # Add buttons for background removal management
+        bg_buttons_layout = QHBoxLayout()
+        refresh_rembg_btn = QPushButton("Refresh Status")
+        refresh_rembg_btn.clicked.connect(self.refresh_rembg_status)
+        bg_buttons_layout.addWidget(refresh_rembg_btn)
+        
+        install_rembg_btn = QPushButton("Install rembg")
+        install_rembg_btn.clicked.connect(self.install_rembg)
+        bg_buttons_layout.addWidget(install_rembg_btn)
+        
+        effects_layout.addLayout(bg_buttons_layout)
+        
+        # Add tabs to tab widget
+        self.tab_widget.addTab(resize_tab, "Resize & Save")
+        self.tab_widget.addTab(adjustments_tab, "Adjustments")
+        self.tab_widget.addTab(transform_tab, "Transform")
+        self.tab_widget.addTab(effects_tab, "Effects")
+        
+        # Create info bar with current size and zoom info
+        info_bar = QWidget()
+        info_layout = QHBoxLayout(info_bar)
+        info_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Add current info label
+        self.info_label = QLabel("Size: N/A")
+        info_layout.addWidget(self.info_label)
+        
+        # Add spacer to push zoom info to the right
+        info_layout.addStretch()
+        
+        # Add zoom info label
+        self.zoom_info_label = QLabel("Zoom: 100%")
+        info_layout.addWidget(self.zoom_info_label)
+        
+        # Add progress bar (initially hidden)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        info_layout.addWidget(self.progress_bar)
+        self.progress_bar.setMaximumWidth(200)
+        
+        # Add components to main layout
+        main_layout.addWidget(self.tab_widget)
+        main_layout.addWidget(self.image_label, 1)  # Give image label a stretch factor of 1
+        main_layout.addWidget(info_bar)
+        
+        # Set the central widget
+        self.setCentralWidget(central_widget)
+        
         # Set appropriate style based on dark mode
         if self.is_dark_mode:
             self.setStyleSheet("""
@@ -487,404 +961,25 @@ class ImageEditorApp(QMainWindow):
                     padding: 5px;
                     border-radius: 3px;
                 }
-                QGroupBox {
-                    color: white;
+                QTabWidget::pane {
                     border: 1px solid #555555;
-                    border-radius: 5px;
-                    margin-top: 10px;
-                }
-                QGroupBox::title {
-                    subcontrol-origin: margin;
-                    left: 10px;
-                    padding: 0 5px;
-                }
-                QProgressBar {
-                    border: 1px solid #555555;
-                    border-radius: 3px;
-                    text-align: center;
-                    background-color: #333337;
-                }
-                QProgressBar::chunk {
-                    background-color: #007ACC;
-                }
-                QCheckBox {
-                    color: #FFFFFF;
-                }
-            """)
-        else:
-            self.setStyleSheet("""
-                QMainWindow, QWidget {
-                    background-color: #F0F0F0;
-                    color: #000000;
-                }
-                QPushButton {
-                    background-color: #0078D7;
-                    color: white;
-                    border: none;
-                    padding: 8px 16px;
-                    border-radius: 4px;
-                }
-                QPushButton:hover {
-                    background-color: #106EBE;
-                }
-                QPushButton:pressed {
-                    background-color: #005A9E;
-                }
-                QComboBox, QSpinBox {
-                    background-color: #FFFFFF;
-                    color: black;
-                    border: 1px solid #CCCCCC;
-                    padding: 5px;
-                    border-radius: 3px;
-                }
-                QGroupBox {
-                    color: #000000;
-                    border: 1px solid #CCCCCC;
-                    border-radius: 5px;
-                    margin-top: 10px;
-                }
-                QGroupBox::title {
-                    subcontrol-origin: margin;
-                    left: 10px;
-                    padding: 0 5px;
-                }
-                QProgressBar {
-                    border: 1px solid #CCCCCC;
-                    border-radius: 3px;
-                    text-align: center;
-                }
-                QProgressBar::chunk {
-                    background-color: #0078D7;
-                }
-            """)
-        
-        # Create main widget and layout
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        
-        # Image display area - Use custom label for transparent images
-        self.image_label = ZoomableImageLabel("No image loaded")
-        self.image_label.set_dark_mode(self.is_dark_mode)
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(400, 300)
-        bg_color = "#1E1E1E" if self.is_dark_mode else "#FFFFFF"
-        self.image_label.setStyleSheet(f"border: 2px dashed #555555; background-color: {bg_color};")
-        self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        main_layout.addWidget(self.image_label)
-        
-        # Add zoom info label below the image
-        self.zoom_info_label = QLabel("Zoom: 100%")
-        self.zoom_info_label.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(self.zoom_info_label)
-        
-        # Control panels
-        controls_layout = QHBoxLayout()
-        
-        # Image loading panel
-        load_group = QGroupBox("Image Source")
-        load_layout = QVBoxLayout(load_group)
-        self.load_btn = QPushButton("Load Image")
-        self.load_btn.clicked.connect(self.load_image)
-        load_layout.addWidget(self.load_btn)
-        
-        # Image info
-        self.info_label = QLabel("Size: N/A")
-        load_layout.addWidget(self.info_label)
-        
-        # Add zoom controls to the load panel
-        zoom_layout = QHBoxLayout()
-        self.zoom_in_btn = QPushButton("Zoom In")
-        self.zoom_in_btn.clicked.connect(self.zoom_in_action_triggered)
-        self.zoom_in_btn.setToolTip("Zoom in (Ctrl++)")
-        
-        self.zoom_out_btn = QPushButton("Zoom Out")
-        self.zoom_out_btn.clicked.connect(self.zoom_out_action_triggered)
-        self.zoom_out_btn.setToolTip("Zoom out (Ctrl+-)")
-        
-        self.zoom_reset_btn = QPushButton("Reset Zoom")
-        self.zoom_reset_btn.clicked.connect(self.zoom_reset_action_triggered)
-        self.zoom_reset_btn.setToolTip("Reset zoom to 100% (Ctrl+0)")
-        
-        zoom_layout.addWidget(self.zoom_in_btn)
-        zoom_layout.addWidget(self.zoom_out_btn)
-        load_layout.addLayout(zoom_layout)
-        load_layout.addWidget(self.zoom_reset_btn)
-        
-        controls_layout.addWidget(load_group)
-        
-        # Resize panel
-        resize_group = QGroupBox("Resize Options")
-        resize_layout = QVBoxLayout(resize_group)
-        
-        # Width control
-        width_layout = QHBoxLayout()
-        width_layout.addWidget(QLabel("Width:"))
-        self.width_spin = QSpinBox()
-        self.width_spin.setRange(1, 9999)
-        self.width_spin.valueChanged.connect(self.update_height_maintain_ratio)
-        width_layout.addWidget(self.width_spin)
-        resize_layout.addLayout(width_layout)
-        
-        # Height control
-        height_layout = QHBoxLayout()
-        height_layout.addWidget(QLabel("Height:"))
-        self.height_spin = QSpinBox()
-        self.height_spin.setRange(1, 9999)
-        self.height_spin.valueChanged.connect(self.update_width_maintain_ratio)
-        height_layout.addWidget(self.height_spin)
-        resize_layout.addLayout(height_layout)
-        
-        # Maintain aspect ratio
-        self.maintain_ratio = False
-        self.ratio_btn = QPushButton("Maintain Ratio: OFF")
-        self.ratio_btn.setCheckable(True)
-        self.ratio_btn.setChecked(False)
-        self.ratio_btn.clicked.connect(self.toggle_aspect_ratio)
-        resize_layout.addWidget(self.ratio_btn)
-        
-        # Preview button
-        self.preview_btn = QPushButton("Apply Changes")
-        self.preview_btn.clicked.connect(self.preview_changes)
-        self.preview_btn.setToolTip("Apply resize and other changes (Ctrl+P)")
-        # Add keyboard shortcut for preview
-        preview_shortcut = QKeySequence("Ctrl+P")
-        self.preview_action = QAction("Preview", self)
-        self.preview_action.setShortcut(preview_shortcut)
-        self.preview_action.triggered.connect(self.preview_changes)
-        self.toolbar.addAction(self.preview_action)
-        resize_layout.addWidget(self.preview_btn)
-        
-        controls_layout.addWidget(resize_group)
-        
-        # Add Transform panel for rotation and flipping
-        transform_group = QGroupBox("Transform")
-        transform_layout = QVBoxLayout(transform_group)
-        
-        # Rotation buttons
-        rotation_layout = QHBoxLayout()
-        self.rotate_90_btn = QPushButton("Rotate 90°")
-        self.rotate_90_btn.clicked.connect(lambda: self.rotate_image(90))
-        self.rotate_90_btn.setToolTip("Rotate image 90 degrees clockwise")
-        
-        self.rotate_180_btn = QPushButton("Rotate 180°")
-        self.rotate_180_btn.clicked.connect(lambda: self.rotate_image(180))
-        self.rotate_180_btn.setToolTip("Rotate image 180 degrees")
-        
-        self.rotate_270_btn = QPushButton("Rotate 270°")
-        self.rotate_270_btn.clicked.connect(lambda: self.rotate_image(270))
-        self.rotate_270_btn.setToolTip("Rotate image 270 degrees clockwise (90 degrees counterclockwise)")
-        
-        rotation_layout.addWidget(self.rotate_90_btn)
-        rotation_layout.addWidget(self.rotate_180_btn)
-        rotation_layout.addWidget(self.rotate_270_btn)
-        transform_layout.addLayout(rotation_layout)
-        
-        # Fine rotation arrows
-        fine_rotation_layout = QHBoxLayout()
-        fine_rotation_layout.addWidget(QLabel("Fine Rotation:"))
-        
-        self.rotate_left_btn = QPushButton("↺")  # Counter-clockwise arrow
-        self.rotate_left_btn.clicked.connect(lambda: self.rotate_image_fine(-5))
-        self.rotate_left_btn.setToolTip("Rotate 5° counter-clockwise")
-        self.rotate_left_btn.setMaximumWidth(40)
-        
-        self.rotate_right_btn = QPushButton("↻")  # Clockwise arrow
-        self.rotate_right_btn.clicked.connect(lambda: self.rotate_image_fine(5))
-        self.rotate_right_btn.setToolTip("Rotate 5° clockwise")
-        self.rotate_right_btn.setMaximumWidth(40)
-        
-        fine_rotation_layout.addWidget(self.rotate_left_btn)
-        fine_rotation_layout.addWidget(self.rotate_right_btn)
-        transform_layout.addLayout(fine_rotation_layout)
-        
-        # Flip buttons
-        flip_layout = QHBoxLayout()
-        self.flip_h_btn = QPushButton("Flip Horizontal")
-        self.flip_h_btn.clicked.connect(lambda: self.flip_image("horizontal"))
-        self.flip_h_btn.setToolTip("Flip image horizontally (mirror)")
-        
-        self.flip_v_btn = QPushButton("Flip Vertical")
-        self.flip_v_btn.clicked.connect(lambda: self.flip_image("vertical"))
-        self.flip_v_btn.setToolTip("Flip image vertically (upside down)")
-        
-        flip_layout.addWidget(self.flip_h_btn)
-        flip_layout.addWidget(self.flip_v_btn)
-        transform_layout.addLayout(flip_layout)
-        
-        controls_layout.addWidget(transform_group)
-        
-        # Background removal
-        bg_group = QGroupBox("Background Removal")
-        bg_layout = QVBoxLayout(bg_group)
-        
-        self.remove_bg_check = QCheckBox("Remove Background")
-        self.remove_bg_btn = QPushButton("Remove Background")
-        self.remove_bg_btn.clicked.connect(lambda: self.apply_background_removal(self.current_image))
-        self.remove_bg_btn.setToolTip("Remove the background from the image (Ctrl+B)")
-        # Add keyboard shortcut for background removal
-        bg_shortcut = QKeySequence("Ctrl+B")
-        self.bg_action = QAction("Remove Background", self)
-        self.bg_action.setShortcut(bg_shortcut)
-        self.bg_action.triggered.connect(lambda: self.apply_background_removal(self.current_image))
-        self.toolbar.addAction(self.bg_action)
-        
-        bg_layout.addWidget(self.remove_bg_btn)
-        controls_layout.addWidget(bg_group)
-        
-        # Format panel
-        format_group = QGroupBox("Format Options")
-        format_layout = QVBoxLayout(format_group)
-        
-        format_layout.addWidget(QLabel("Output Format:"))
-        self.format_combo = QComboBox()
-        self.format_combo.addItems(["JPEG", "PNG", "BMP", "TIFF", "GIF", "WEBP", "ICO", "SVG"])
-        self.format_combo.currentTextChanged.connect(self.format_changed)
-        format_layout.addWidget(self.format_combo)
-        
-        # Background removal option
-        self.rembg_status_label = QLabel(f"Background Removal: {'Available' if REMBG_AVAILABLE else 'Not Available'}")
-        self.rembg_status_label.setStyleSheet(
-            "color: #00AA00; font-weight: bold;" if REMBG_AVAILABLE else "color: #FF5500; font-weight: bold;"
-        )
-        format_layout.addWidget(self.rembg_status_label)
-        
-        # Icon size options (for ICO format)
-        self.ico_options_group = QGroupBox("Icon Options")
-        self.ico_options_layout = QVBoxLayout(self.ico_options_group)
-        
-        # Size selection for icons
-        self.ico_options_layout.addWidget(QLabel("Icon Sizes:"))
-        self.ico_sizes_layout = QHBoxLayout()
-        
-        # Checkboxes for common icon sizes
-        self.size_16 = QCheckBox("16×16")
-        self.size_16.setChecked(True)
-        self.size_32 = QCheckBox("32×32") 
-        self.size_32.setChecked(True)
-        self.size_48 = QCheckBox("48×48")
-        self.size_64 = QCheckBox("64×64")
-        self.size_128 = QCheckBox("128×128")
-        self.size_256 = QCheckBox("256×256")
-        
-        self.ico_sizes_layout.addWidget(self.size_16)
-        self.ico_sizes_layout.addWidget(self.size_32)
-        self.ico_sizes_layout.addWidget(self.size_48)
-        self.ico_sizes_layout.addWidget(self.size_64)
-        self.ico_sizes_layout.addWidget(self.size_128)
-        self.ico_sizes_layout.addWidget(self.size_256)
-        
-        self.ico_options_layout.addLayout(self.ico_sizes_layout)
-        format_layout.addWidget(self.ico_options_group)
-        self.ico_options_group.setVisible(False)
-        
-        # SVG Options
-        self.svg_options_group = QGroupBox("SVG Options")
-        self.svg_options_layout = QVBoxLayout(self.svg_options_group)
-        
-        # Quality option for SVG export
-        self.svg_options_layout.addWidget(QLabel("Image Quality for SVG:"))
-        quality_layout = QHBoxLayout()
-        self.svg_quality_slider = QSlider(Qt.Horizontal)
-        self.svg_quality_slider.setRange(1, 100)
-        self.svg_quality_slider.setValue(85)
-        self.svg_quality_slider.setTickPosition(QSlider.TicksBelow)
-        quality_layout.addWidget(self.svg_quality_slider)
-        self.svg_quality_value = QLabel("85%")
-        quality_layout.addWidget(self.svg_quality_value)
-        self.svg_options_layout.addLayout(quality_layout)
-        self.svg_quality_slider.valueChanged.connect(self.update_svg_quality_label)
-        
-        # Add a status indicator for svglib
-        self.svglib_status_label = QLabel(f"SVG Library: {'Available' if SVGLIB_AVAILABLE else 'Not Available'}")
-        self.svglib_status_label.setStyleSheet(
-            "color: #00AA00; font-weight: bold;" if SVGLIB_AVAILABLE else "color: #FF5500; font-weight: bold;"
-        )
-        self.svg_options_layout.addWidget(self.svglib_status_label)
-        
-        # Add button to install SVG dependencies
-        self.install_svg_deps_btn = QPushButton("Install SVG Dependencies")
-        self.install_svg_deps_btn.clicked.connect(self.install_svg_dependencies)
-        self.svg_options_layout.addWidget(self.install_svg_deps_btn)
-        
-        format_layout.addWidget(self.svg_options_group)
-        self.svg_options_group.setVisible(False)
-        
-        # Quality slider for JPEG
-        quality_layout = QHBoxLayout()
-        quality_layout.addWidget(QLabel("Quality:"))
-        self.quality_slider = QSlider(Qt.Horizontal)
-        self.quality_slider.setRange(1, 100)
-        self.quality_slider.setValue(85)
-        self.quality_slider.setTickPosition(QSlider.TicksBelow)
-        self.quality_slider.setTickInterval(10)
-        quality_layout.addWidget(self.quality_slider)
-        self.quality_value = QLabel("85%")
-        quality_layout.addWidget(self.quality_value)
-        format_layout.addLayout(quality_layout)
-        self.quality_slider.valueChanged.connect(self.update_quality_label)
-        
-        controls_layout.addWidget(format_group)
-        
-        # Save panel
-        save_group = QGroupBox("Save Options")
-        save_layout = QVBoxLayout(save_group)
-        
-        self.save_btn = QPushButton("Save Image")
-        self.save_btn.clicked.connect(self.save_image)
-        save_layout.addWidget(self.save_btn)
-        
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        save_layout.addWidget(self.progress_bar)
-        
-        controls_layout.addWidget(save_group)
-        
-        main_layout.addLayout(controls_layout)
-        
-        # Status bar
-        self.statusBar().showMessage('Ready')
-    
-    def toggle_theme(self):
-        """Switch between dark and light modes."""
-        self.is_dark_mode = not self.is_dark_mode
-        self.image_label.set_dark_mode(self.is_dark_mode)
-        
-        # Update theme action text
-        self.theme_action.setText(f"{'Dark' if not self.is_dark_mode else 'Light'} Mode")
-        
-        # Apply appropriate stylesheet based on theme
-        if self.is_dark_mode:
-            self.setStyleSheet("""
-                QMainWindow, QWidget {
                     background-color: #2D2D30;
+                }
+                QTabBar::tab {
+                    background-color: #3E3E42;
                     color: #FFFFFF;
-                }
-                QLabel {
-                    color: #FFFFFF;
-                }
-                QPushButton {
-                    background-color: #007ACC;
-                    color: white;
-                    border: none;
-                    padding: 8px 16px;
-                    border-radius: 4px;
-                }
-                QPushButton:hover {
-                    background-color: #005999;
-                }
-                QPushButton:pressed {
-                    background-color: #004C80;
-                }
-                QComboBox, QSpinBox {
-                    background-color: #333337;
-                    color: white;
                     border: 1px solid #555555;
-                    padding: 5px;
-                    border-radius: 3px;
+                    border-bottom: none;
+                    padding: 5px 10px;
+                    margin-right: 2px;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                }
+                QTabBar::tab:selected {
+                    background-color: #007ACC;
+                }
+                QTabBar::tab:hover:!selected {
+                    background-color: #505054;
                 }
                 QGroupBox {
                     color: white;
@@ -908,6 +1003,24 @@ class ImageEditorApp(QMainWindow):
                 }
                 QCheckBox {
                     color: #FFFFFF;
+                }
+                QSlider::groove:horizontal {
+                    border: 1px solid #555555;
+                    height: 8px;
+                    background: #333337;
+                    margin: 2px 0;
+                    border-radius: 4px;
+                }
+                QSlider::handle:horizontal {
+                    background: #007ACC;
+                    border: 1px solid #007ACC;
+                    width: 18px;
+                    margin: -2px 0;
+                    border-radius: 9px;
+                }
+                QSlider::handle:horizontal:hover {
+                    background: #005999;
+                    border: 1px solid #005999;
                 }
             """)
             
@@ -939,6 +1052,27 @@ class ImageEditorApp(QMainWindow):
                     padding: 5px;
                     border-radius: 3px;
                 }
+                QTabWidget::pane {
+                    border: 1px solid #CCCCCC;
+                    background-color: #F0F0F0;
+                }
+                QTabBar::tab {
+                    background-color: #E1E1E1;
+                    color: #000000;
+                    border: 1px solid #CCCCCC;
+                    border-bottom: none;
+                    padding: 5px 10px;
+                    margin-right: 2px;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                }
+                QTabBar::tab:selected {
+                    background-color: #0078D7;
+                    color: white;
+                }
+                QTabBar::tab:hover:!selected {
+                    background-color: #D0D0D0;
+                }
                 QGroupBox {
                     color: #000000;
                     border: 1px solid #CCCCCC;
@@ -958,17 +1092,39 @@ class ImageEditorApp(QMainWindow):
                 QProgressBar::chunk {
                     background-color: #0078D7;
                 }
+                QSlider::groove:horizontal {
+                    border: 1px solid #CCCCCC;
+                    height: 8px;
+                    background: #FFFFFF;
+                    margin: 2px 0;
+                    border-radius: 4px;
+                }
+                QSlider::handle:horizontal {
+                    background: #0078D7;
+                    border: 1px solid #0078D7;
+                    width: 18px;
+                    margin: -2px 0;
+                    border-radius: 9px;
+                }
+                QSlider::handle:horizontal:hover {
+                    background: #106EBE;
+                    border: 1px solid #106EBE;
+                }
             """)
             
             # Update image label background
             self.image_label.setStyleSheet("border: 2px dashed #555555; background-color: #FFFFFF;")
         
+        # Make sure to tell the ZoomableImageLabel about the dark mode
+        if isinstance(self.image_label, TransparentBackgroundLabel):
+            self.image_label.set_dark_mode(self.is_dark_mode)
+        
         # If an image is loaded, reload it to apply the new theme to the display
         if hasattr(self, 'temp_preview_path') and os.path.exists(self.temp_preview_path):
             self.display_image(self.temp_preview_path)
-        
+            
         logger.info(f"Theme changed to {'dark' if self.is_dark_mode else 'light'} mode")
-    
+
     def refresh_rembg_status(self):
         """Check if rembg is available again."""
         global REMBG_AVAILABLE
@@ -1851,6 +2007,203 @@ class ImageEditorApp(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to rotate image: {str(e)}")
             logger.error(f"Fine rotation error: {str(e)}")
             logger.error(traceback.format_exc())
+
+    def toggle_theme(self):
+        """Toggle between dark and light mode."""
+        # Toggle the dark mode flag
+        self.is_dark_mode = not self.is_dark_mode
+        
+        # Update the theme action text
+        self.theme_action.setText(f"{'Light' if self.is_dark_mode else 'Dark'} Mode")
+        
+        # Update the UI with the new theme
+        self.initUI()
+        
+        # Log the theme change
+        logger.info(f"Theme changed to {'dark' if self.is_dark_mode else 'light'} mode")
+        
+        # Update status bar message
+        self.statusBar().showMessage(f"Switched to {'dark' if self.is_dark_mode else 'light'} mode")
+        
+        # Update image display if an image is loaded
+        if self.current_image:
+            self.display_pil_image(self.current_image)
+            
+        # Update the image label's dark mode setting
+        if hasattr(self, 'image_label') and isinstance(self.image_label, TransparentBackgroundLabel):
+            self.image_label.set_dark_mode(self.is_dark_mode)
+
+    def apply_image_adjustments(self):
+        """Apply image adjustments based on slider values."""
+        if self.current_image is None:
+            QMessageBox.warning(self, "Warning", "No image to adjust!")
+            return
+            
+        # Save current state for undo/redo
+        self.save_state()
+        
+        try:
+            # Convert to RGB if it's not already (preserve alpha channel if exists)
+            has_alpha = self.current_image.mode == 'RGBA'
+            if has_alpha:
+                # Separate RGB and alpha channels
+                rgb_image = self.current_image.convert('RGB')
+                alpha_channel = self.current_image.split()[3]
+            else:
+                rgb_image = self.current_image.convert('RGB')
+            
+            # Get adjustment values
+            brightness_factor = 1.0 + (self.brightness_slider.value() / 100.0)  # 0.0-2.0
+            contrast_factor = 1.0 + (self.contrast_slider.value() / 100.0)      # 0.0-2.0
+            saturation_factor = 1.0 + (self.saturation_slider.value() / 100.0)  # 0.0-2.0
+            red_factor = 1.0 + (self.red_slider.value() / 100.0)                # 0.0-2.0
+            green_factor = 1.0 + (self.green_slider.value() / 100.0)            # 0.0-2.0
+            blue_factor = 1.0 + (self.blue_slider.value() / 100.0)              # 0.0-2.0
+            hue_shift = self.hue_slider.value()                                # -180 to 180
+            
+            # Start with brightness
+            if brightness_factor != 1.0:
+                enhancer = ImageEnhance.Brightness(rgb_image)
+                rgb_image = enhancer.enhance(brightness_factor)
+            
+            # Apply contrast
+            if contrast_factor != 1.0:
+                enhancer = ImageEnhance.Contrast(rgb_image)
+                rgb_image = enhancer.enhance(contrast_factor)
+            
+            # Apply saturation
+            if saturation_factor != 1.0:
+                enhancer = ImageEnhance.Color(rgb_image)
+                rgb_image = enhancer.enhance(saturation_factor)
+            
+            # Apply hue shift if not zero
+            if hue_shift != 0:
+                # Convert to numpy array for pixel manipulation
+                img_array = np.array(rgb_image, dtype=np.float32)
+                
+                # Reshape for easier processing
+                h, w, d = img_array.shape
+                img_array = img_array.reshape(h * w, d)
+                
+                # Convert RGB to HSV
+                hsv_array = np.zeros_like(img_array, dtype=np.float32)
+                for i in range(len(img_array)):
+                    pixel = img_array[i]
+                    # Ensure values are in 0-1 range for colorsys
+                    r, g, b = float(pixel[0]/255.0), float(pixel[1]/255.0), float(pixel[2]/255.0)
+                    h_val, s, v = colorsys.rgb_to_hsv(r, g, b)
+                    hsv_array[i] = [h_val, s, v]
+                
+                # Apply hue shift
+                hsv_array[:, 0] = (hsv_array[:, 0] + hue_shift / 360.0) % 1.0
+                
+                # Convert back to RGB
+                rgb_array = np.zeros_like(img_array)
+                for i in range(len(hsv_array)):
+                    pixel = hsv_array[i]
+                    # Extract HSV values as Python floats to ensure compatibility with colorsys
+                    h_val, s, v = float(pixel[0]), float(pixel[1]), float(pixel[2])
+                    r, g, b = colorsys.hsv_to_rgb(h_val, s, v)
+                    # Convert back to 0-255 range and ensure integers
+                    rgb_array[i] = [int(r * 255), int(g * 255), int(b * 255)]
+                
+                # Reshape back to image dimensions
+                rgb_array = rgb_array.reshape(h, w, d).astype(np.uint8)
+                
+                # Convert back to PIL image
+                rgb_image = Image.fromarray(rgb_array)
+            
+            # Apply color balance adjustments
+            if red_factor != 1.0 or green_factor != 1.0 or blue_factor != 1.0:
+                # Convert to numpy array for channel manipulation
+                img_array = np.array(rgb_image)
+                
+                # Adjust each color channel separately
+                r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
+                
+                # Apply color adjustments with proper type conversion
+                if red_factor != 1.0:
+                    r = np.clip(r * red_factor, 0, 255).astype(np.uint8)
+                if green_factor != 1.0:
+                    g = np.clip(g * green_factor, 0, 255).astype(np.uint8)
+                if blue_factor != 1.0:
+                    b = np.clip(b * blue_factor, 0, 255).astype(np.uint8)
+                
+                # Recombine channels
+                img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2] = r, g, b
+                
+                # Convert back to PIL image
+                rgb_image = Image.fromarray(img_array)
+            
+            # Reapply alpha channel if the original image had one
+            if has_alpha:
+                # Convert back to RGBA and reapply alpha channel
+                result_image = rgb_image.convert('RGBA')
+                result_channels = list(result_image.split())
+                result_channels[3] = alpha_channel
+                result_image = Image.merge('RGBA', result_channels)
+            else:
+                result_image = rgb_image
+            
+            # Update current image
+            self.current_image = result_image
+            
+            # Update the display
+            self.display_pil_image(self.current_image)
+            
+            # Update status
+            self.statusBar().showMessage("Image adjustments applied")
+            logger.info("Image adjustments applied")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to apply image adjustments: {str(e)}")
+            logger.error(f"Image adjustment error: {str(e)}")
+            logger.error(traceback.format_exc())
+    
+    def reset_image_adjustments(self):
+        """Reset image adjustments to default values."""
+        if self.current_image is None:
+            QMessageBox.warning(self, "Warning", "No image to adjust!")
+            return
+            
+        # Reset sliders to default values
+        self.brightness_slider.setValue(0)
+        self.contrast_slider.setValue(0)
+        self.saturation_slider.setValue(0)
+        self.hue_slider.setValue(0)
+        self.red_slider.setValue(0)
+        self.green_slider.setValue(0)
+        self.blue_slider.setValue(0)
+        
+        # Update status
+        self.statusBar().showMessage("Image adjustments reset to default")
+        logger.info("Image adjustments reset to default")
+        
+    def reset_to_original(self):
+        """Reset the image to its original state."""
+        if self.original_image is None:
+            QMessageBox.warning(self, "Warning", "No original image to restore!")
+            return
+            
+        # Save current state for undo/redo
+        self.save_state()
+        
+        # Restore the original image
+        self.current_image = self.original_image.copy()
+        
+        # Reset all sliders to default values
+        self.reset_image_adjustments()
+        
+        # Update the display
+        self.display_pil_image(self.current_image)
+        
+        # Update size info
+        self.width_spin.setValue(self.original_size[0])
+        self.height_spin.setValue(self.original_size[1])
+        
+        # Update status
+        self.statusBar().showMessage("Image reset to original")
+        logger.info("Image reset to original")
 
 def main():
     app = QApplication(sys.argv)

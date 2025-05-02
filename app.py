@@ -3,8 +3,8 @@ import os
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton, 
                            QVBoxLayout, QHBoxLayout, QWidget, QFileDialog,
                            QSpinBox, QComboBox, QSlider, QMessageBox, QGroupBox,
-                           QSizePolicy, QProgressBar, QCheckBox)
-from PyQt5.QtGui import QPixmap, QImage, QPalette, QColor, QIcon, QPainter, QBrush
+                           QSizePolicy, QProgressBar, QCheckBox, QToolBar, QAction)
+from PyQt5.QtGui import QPixmap, QImage, QPalette, QColor, QIcon, QPainter, QBrush, QKeySequence
 from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QRect
 from PIL import Image, ImageQt
 import numpy as np
@@ -193,16 +193,28 @@ class ImageEditorApp(QMainWindow):
         brightness = (window_color.red() + window_color.green() + window_color.blue()) / 3
         self.is_dark_mode = brightness < 128
         
+        # Initialize history for undo/redo
+        self.history = []
+        self.history_position = -1
+        self.max_history = 20  # Maximum number of states to store
+        
+        # Enable drag and drop
+        self.setAcceptDrops(True)
+        
         self.initUI()
         
         # Initialize variables
         self.current_image = None
         self.current_image_path = None
+        self.original_image = None
         self.original_size = (0, 0)
         self.temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
         if not os.path.exists(self.temp_dir):
             os.makedirs(self.temp_dir)
         self.temp_preview_path = os.path.join(self.temp_dir, "temp_preview.png")
+        
+        # Show welcome dialog with new features information
+        self.show_welcome_dialog()
         
         # Log initialization
         logger.info(f"Application started. Dark mode: {self.is_dark_mode}")
@@ -210,8 +222,45 @@ class ImageEditorApp(QMainWindow):
         
     def initUI(self):
         # Set window properties
-        self.setWindowTitle('Picture Editor')
-        self.setGeometry(100, 100, 1000, 700)
+        self.setWindowTitle("Image Editor with Background Removal")
+        self.setMinimumSize(1000, 600)
+        
+        # Create toolbar
+        self.toolbar = QToolBar("Main Toolbar")
+        self.addToolBar(self.toolbar)
+        
+        # Add dark mode toggle action
+        icon_name = "moon.png" if not self.is_dark_mode else "sun.png"
+        self.theme_action = QAction(f"{'Dark' if not self.is_dark_mode else 'Light'} Mode", self)
+        self.theme_action.triggered.connect(self.toggle_theme)
+        self.toolbar.addAction(self.theme_action)
+        
+        # Add undo/redo actions with keyboard shortcuts
+        self.undo_action = QAction("Undo", self)
+        self.undo_action.setShortcut(QKeySequence.Undo)  # Ctrl+Z
+        self.undo_action.triggered.connect(self.undo)
+        self.undo_action.setEnabled(False)
+        self.toolbar.addAction(self.undo_action)
+        
+        self.redo_action = QAction("Redo", self)
+        self.redo_action.setShortcut(QKeySequence.Redo)  # Ctrl+Y or Ctrl+Shift+Z
+        self.redo_action.triggered.connect(self.redo)
+        self.redo_action.setEnabled(False)
+        self.toolbar.addAction(self.redo_action)
+        
+        # Add more common actions with keyboard shortcuts
+        self.open_action = QAction("Open", self)
+        self.open_action.setShortcut(QKeySequence.Open)  # Ctrl+O
+        self.open_action.triggered.connect(self.load_image)
+        self.toolbar.addAction(self.open_action)
+        
+        self.save_action = QAction("Save", self)
+        self.save_action.setShortcut(QKeySequence.Save)  # Ctrl+S
+        self.save_action.triggered.connect(self.save_image)
+        self.toolbar.addAction(self.save_action)
+        
+        # Add separator in toolbar
+        self.toolbar.addSeparator()
         
         # Set appropriate style based on dark mode
         if self.is_dark_mode:
@@ -319,14 +368,6 @@ class ImageEditorApp(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
         
-        # Add theme toggle button at the top
-        theme_layout = QHBoxLayout()
-        self.theme_btn = QPushButton("Toggle Dark/Light Mode")
-        self.theme_btn.clicked.connect(self.toggle_theme)
-        theme_layout.addStretch(1)
-        theme_layout.addWidget(self.theme_btn)
-        main_layout.addLayout(theme_layout)
-        
         # Image display area - Use custom label for transparent images
         self.image_label = TransparentBackgroundLabel("No image loaded")
         self.image_label.set_dark_mode(self.is_dark_mode)
@@ -375,19 +416,44 @@ class ImageEditorApp(QMainWindow):
         resize_layout.addLayout(height_layout)
         
         # Maintain aspect ratio
-        self.maintain_ratio = True
-        self.ratio_btn = QPushButton("Maintain Ratio: ON")
+        self.maintain_ratio = False
+        self.ratio_btn = QPushButton("Maintain Ratio: OFF")
         self.ratio_btn.setCheckable(True)
-        self.ratio_btn.setChecked(True)
+        self.ratio_btn.setChecked(False)
         self.ratio_btn.clicked.connect(self.toggle_aspect_ratio)
         resize_layout.addWidget(self.ratio_btn)
         
         # Preview button
-        self.preview_btn = QPushButton("Preview Changes")
+        self.preview_btn = QPushButton("Apply Changes")
         self.preview_btn.clicked.connect(self.preview_changes)
+        self.preview_btn.setToolTip("Apply resize and other changes (Ctrl+P)")
+        # Add keyboard shortcut for preview
+        preview_shortcut = QKeySequence("Ctrl+P")
+        self.preview_action = QAction("Preview", self)
+        self.preview_action.setShortcut(preview_shortcut)
+        self.preview_action.triggered.connect(self.preview_changes)
+        self.toolbar.addAction(self.preview_action)
         resize_layout.addWidget(self.preview_btn)
         
         controls_layout.addWidget(resize_group)
+        
+        # Background removal
+        bg_group = QGroupBox("Background Removal")
+        bg_layout = QVBoxLayout(bg_group)
+        
+        self.remove_bg_check = QCheckBox("Remove Background")
+        self.remove_bg_btn = QPushButton("Remove Background")
+        self.remove_bg_btn.clicked.connect(lambda: self.apply_background_removal(self.current_image))
+        self.remove_bg_btn.setToolTip("Remove the background from the image (Ctrl+B)")
+        # Add keyboard shortcut for background removal
+        bg_shortcut = QKeySequence("Ctrl+B")
+        self.bg_action = QAction("Remove Background", self)
+        self.bg_action.setShortcut(bg_shortcut)
+        self.bg_action.triggered.connect(lambda: self.apply_background_removal(self.current_image))
+        self.toolbar.addAction(self.bg_action)
+        
+        bg_layout.addWidget(self.remove_bg_btn)
+        controls_layout.addWidget(bg_group)
         
         # Format panel
         format_group = QGroupBox("Format Options")
@@ -400,13 +466,6 @@ class ImageEditorApp(QMainWindow):
         format_layout.addWidget(self.format_combo)
         
         # Background removal option
-        self.remove_bg_check = QCheckBox("Remove Background")
-        rembg_status = "Available" if REMBG_AVAILABLE else "Not Available"
-        self.remove_bg_check.setEnabled(REMBG_AVAILABLE)
-        self.remove_bg_check.setToolTip(f"Background removal: {rembg_status}")
-        format_layout.addWidget(self.remove_bg_check)
-        
-        # Simple status label for rembg
         self.rembg_status_label = QLabel(f"Background Removal: {'Available' if REMBG_AVAILABLE else 'Not Available'}")
         self.rembg_status_label.setStyleSheet(
             "color: #00AA00; font-weight: bold;" if REMBG_AVAILABLE else "color: #FF5500; font-weight: bold;"
@@ -517,7 +576,10 @@ class ImageEditorApp(QMainWindow):
         self.is_dark_mode = not self.is_dark_mode
         self.image_label.set_dark_mode(self.is_dark_mode)
         
-        # Apply the appropriate style
+        # Update theme action text
+        self.theme_action.setText(f"{'Dark' if not self.is_dark_mode else 'Light'} Mode")
+        
+        # Apply appropriate stylesheet based on theme
         if self.is_dark_mode:
             self.setStyleSheet("""
                 QMainWindow, QWidget {
@@ -766,42 +828,50 @@ class ImageEditorApp(QMainWindow):
             return False
     
     def load_image(self):
+        """Open file dialog to select and load an image."""
         file_path, _ = QFileDialog.getOpenFileName(
             self, 'Open Image', '', 'Image Files (*.png *.jpg *.jpeg *.bmp *.tiff *.gif *.webp)')
         
         if file_path:
-            try:
-                self.current_image_path = file_path
-                self.current_image = Image.open(file_path)
-                self.original_size = self.current_image.size
-                
-                # Update spinboxes with image dimensions
-                self.width_spin.setValue(self.original_size[0])
-                self.height_spin.setValue(self.original_size[1])
-                
-                # Display image
-                self.display_image(file_path)
-                self.info_label.setText(f"Size: {self.original_size[0]}x{self.original_size[1]}")
-                self.statusBar().showMessage(f'Loaded: {os.path.basename(file_path)}')
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Could not load image: {str(e)}")
+            self.load_image_from_path(file_path)
     
     def display_image(self, image_path):
+        """Display an image in the UI from a file path."""
+        if not os.path.exists(image_path):
+            logger.error(f"Image file not found: {image_path}")
+            return
+            
         try:
-            pixmap = QPixmap(image_path)
+            # Load the image with PIL, preserving transparency
+            img = Image.open(image_path)
             
-            # Scale pixmap to fit label while maintaining aspect ratio
-            pixmap = pixmap.scaled(
-                self.image_label.width(), 
-                self.image_label.height(),
-                Qt.KeepAspectRatio, 
-                Qt.SmoothTransformation
-            )
+            # Ensure we keep transparency information
+            if img.format == 'PNG' and img.mode != 'RGBA':
+                img = img.convert('RGBA')
+                
+            self.original_image = img.copy()  # Store the original image
+            self.current_image = img.copy()   # Store a copy as the current working image
+            self.current_image_path = image_path
+            self.original_size = img.size
             
-            self.image_label.setPixmap(pixmap)
+            # Update width and height spinners
+            self.width_spin.setValue(self.original_size[0])
+            self.height_spin.setValue(self.original_size[1])
+            
+            # Display the image
+            self.display_pil_image(self.current_image)
+            
+            # Clear the history and save initial state
+            self.history = []
+            self.history_position = -1
+            self.save_state()
+            
+            # Update status
+            self.statusBar().showMessage(f"Loaded: {os.path.basename(image_path)} - {self.original_size[0]}x{self.original_size[1]} - Mode: {img.mode}")
+            logger.info(f"Displayed image: {image_path} with mode {img.mode}")
         except Exception as e:
+            logger.error(f"Error displaying image: {str(e)}")
             QMessageBox.critical(self, "Error", f"Could not display image: {str(e)}")
-            logger.error(f"Display error: {str(e)}")
     
     def update_height_maintain_ratio(self):
         if self.maintain_ratio and self.original_size[0] > 0:
@@ -810,6 +880,7 @@ class ImageEditorApp(QMainWindow):
             self.height_spin.blockSignals(True)
             self.height_spin.setValue(new_height)
             self.height_spin.blockSignals(False)
+        # If maintain_ratio is false, do nothing - let the user set any value
     
     def update_width_maintain_ratio(self):
         if self.maintain_ratio and self.original_size[1] > 0:
@@ -818,6 +889,7 @@ class ImageEditorApp(QMainWindow):
             self.width_spin.blockSignals(True)
             self.width_spin.setValue(new_width)
             self.width_spin.blockSignals(False)
+        # If maintain_ratio is false, do nothing - let the user set any value
     
     def toggle_aspect_ratio(self):
         self.maintain_ratio = self.ratio_btn.isChecked()
@@ -831,67 +903,46 @@ class ImageEditorApp(QMainWindow):
         self.svg_quality_value.setText(f"{self.svg_quality_slider.value()}%")
     
     def apply_background_removal(self, img):
-        """Prepare for background removal using the background removal thread."""
-        if not REMBG_AVAILABLE or not self.remove_bg_check.isChecked():
-            return img
+        """Remove background from image using rembg."""
+        if not REMBG_AVAILABLE:
+            QMessageBox.warning(self, "Feature Not Available", 
+                               "Background removal is not available because the 'rembg' package is not installed.\n\n"
+                               "Click the 'Install rembg' button in the status panel to install it.")
+            return
+            
+        # Save current state before background removal
+        self.save_state()
+            
+        # Show progress bar
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
         
-        try:
-            # Import required functions here again to ensure they're available
-            from rembg import remove
-            from rembg.session_factory import new_session
-            
-            # Create and start the background removal thread
-            self.bg_thread = BackgroundRemovalThread(img)
-            self.bg_thread.finished.connect(self.on_bg_removal_finished)
-            self.bg_thread.progress.connect(self.update_progress)
-            self.bg_thread.error.connect(self.on_bg_removal_error)
-            self.bg_thread.start()
-            
-            # Show a message that we're waiting
-            self.statusBar().showMessage('Removing background, please wait...')
-            
-            # Create a modal processing dialog to prevent user interaction
-            self.processing_dialog = QMessageBox(self)
-            self.processing_dialog.setWindowTitle("Processing")
-            self.processing_dialog.setText("Removing background...\nThis may take a few moments.")
-            self.processing_dialog.setStandardButtons(QMessageBox.NoButton)
-            self.processing_dialog.setModal(True)
-            
-            # Add a progress bar to the dialog
-            layout = self.processing_dialog.layout()
-            progress = QProgressBar(self.processing_dialog)
-            progress.setRange(0, 0)  # Indeterminate progress
-            layout.addWidget(progress, layout.rowCount(), 0, 1, layout.columnCount())
-            
-            # Show dialog and wait for thread to complete
-            self.processing_dialog.exec_()
-            
-            # Wait for thread to finish and return the processed image
-            if hasattr(self, 'processed_image'):
-                img = self.processed_image
-                delattr(self, 'processed_image')
-            
-            return img
+        # Create and start background thread
+        self.bg_thread = BackgroundRemovalThread(img)
+        self.bg_thread.progress.connect(self.update_progress)
+        self.bg_thread.finished.connect(self.on_bg_removal_finished)
+        self.bg_thread.error.connect(self.on_bg_removal_error)
+        self.bg_thread.start()
         
-        except Exception as e:
-            logger.error(f"Error in apply_background_removal: {str(e)}")
-            logger.error(traceback.format_exc())
-            QMessageBox.critical(self, "Background Removal Error", 
-                               f"Error preparing background removal: {str(e)}")
-            return img
+        logger.info("Background removal started")
     
     def on_bg_removal_finished(self, result_image):
         """Handle the completion of background removal thread."""
-        self.processed_image = result_image
+        # Ensure the result maintains RGBA mode for transparency
+        if result_image.mode != 'RGBA':
+            result_image = result_image.convert('RGBA')
+            
+        self.current_image = result_image
+        
+        # Display the image with transparency
+        self.display_pil_image(self.current_image)
+        
         self.statusBar().showMessage('Background removed')
-        if hasattr(self, 'processing_dialog') and self.processing_dialog:
-            self.processing_dialog.accept()
+        logger.info(f"Background removal completed. Image mode: {self.current_image.mode}")
     
     def on_bg_removal_error(self, error_message):
         """Handle errors from background removal thread."""
         self.statusBar().showMessage(f'Background removal failed: {error_message}')
-        if hasattr(self, 'processing_dialog') and self.processing_dialog:
-            self.processing_dialog.accept()
         QMessageBox.warning(self, "Background Removal Error", 
                            f"Failed to remove background:\n{error_message}")
         logger.error(f"Background removal error: {error_message}")
@@ -901,148 +952,135 @@ class ImageEditorApp(QMainWindow):
         self.progress_bar.setValue(value)
     
     def preview_changes(self):
+        """Preview the changes based on current settings."""
         if self.current_image is None:
-            QMessageBox.warning(self, "Warning", "No image loaded!")
             return
             
-        try:
-            # Start progress
-            self.progress_bar.setValue(10)
+        # Save current state for undo/redo
+        self.save_state()
             
-            # Make a copy of the original image and resize it
-            preview_image = self.current_image.copy()
+        # Make a copy of the original image and resize it
+        if self.original_image:
+            preview_image = self.original_image.copy()
             new_size = (self.width_spin.value(), self.height_spin.value())
             
-            # Using correct resampling method
+            # Preserve original image mode to maintain transparency
+            original_mode = preview_image.mode
+            
+            # Perform resize operation while preserving transparency
             preview_image = preview_image.resize(new_size, Image.Resampling.LANCZOS)
-            self.progress_bar.setValue(40)
             
-            # Apply background removal if selected
-            if self.remove_bg_check.isChecked() and REMBG_AVAILABLE:
-                self.statusBar().showMessage('Removing background...')
-                preview_image = self.apply_background_removal(preview_image)
-                self.statusBar().showMessage('Background removed')
-            self.progress_bar.setValue(80)
+            # Make sure we keep the original mode (RGBA for transparent images)
+            if original_mode == 'RGBA' and preview_image.mode != 'RGBA':
+                preview_image = preview_image.convert('RGBA')
             
-            # Always save preview as PNG to support transparency
-            preview_image.save(self.temp_preview_path, format="PNG")
+            # Update the current image with the preview
+            self.current_image = preview_image
             
-            # Display preview
-            self.display_image(self.temp_preview_path)
-            self.statusBar().showMessage(f'Preview: {new_size[0]}x{new_size[1]}')
-            self.progress_bar.setValue(100)
-            
-            # Reset progress bar after a delay
-            QTimer.singleShot(1000, lambda: self.progress_bar.setValue(0))
-        except Exception as e:
-            self.progress_bar.setValue(0)
-            QMessageBox.critical(self, "Error", f"Preview failed: {str(e)}")
-            logger.error(f"Preview error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            logger.error(traceback.format_exc())
+            # Display the preview image
+            self.display_pil_image(self.current_image)
+            logger.info(f"Image preview updated. New size: {new_size}, Mode: {self.current_image.mode}")
+        else:
+            logger.error("No original image to preview changes on")
     
     def save_image(self):
+        """Save the current image to a file."""
         if self.current_image is None:
-            QMessageBox.warning(self, "Warning", "No image loaded!")
-            return
-        
-        # Determine file extension based on selected format
-        format_mapping = {
-            "JPEG": ".jpg",
-            "PNG": ".png",
-            "BMP": ".bmp",
-            "TIFF": ".tiff",
-            "GIF": ".gif",
-            "WEBP": ".webp",
-            "ICO": ".ico",
-            "SVG": ".svg"
-        }
-        
-        selected_format = self.format_combo.currentText()
-        file_ext = format_mapping[selected_format]
-        
-        # Warning for transparency with JPEG
-        if selected_format == "JPEG" and self.remove_bg_check.isChecked():
-            msg = QMessageBox()
-            msg.setIcon(QMessageBox.Warning)
-            msg.setText("JPEG format doesn't support transparency!")
-            msg.setInformativeText("The transparent background will be replaced with white. Do you want to continue?")
-            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            if msg.exec_() == QMessageBox.No:
-                self.format_combo.setCurrentText("PNG")
-                selected_format = "PNG"
-                file_ext = ".png"
-        
-        # Open save dialog with selected format
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, 'Save Image', '', f'{selected_format} Files (*{file_ext})')
-        
-        if not file_path:
+            QMessageBox.warning(self, "Warning", "No image to save!")
             return
             
-        # Add extension if not present
-        if not file_path.lower().endswith(file_ext.lower()):
-            file_path += file_ext
-        
         try:
-            # Prepare the image
-            self.progress_bar.setValue(20)
+            # Get the desired format
+            selected_format = self.format_combo.currentText()
+            default_extension = ".png" if selected_format == "PNG" else ".jpg"
+            
+            # Get save location from user
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Image", 
+                os.path.splitext(os.path.basename(self.current_image_path))[0] + default_extension,
+                "Images (*.png *.jpg *.jpeg *.svg)"
+            )
+            
+            if not file_path:  # User canceled
+                return
+                
+            # Prepare a copy of the image for saving
             img_to_save = self.current_image.copy()
+                
+            # Get file extension
+            _, ext = os.path.splitext(file_path)
+            ext = ext.lower()
             
-            # Resize the image
-            new_size = (self.width_spin.value(), self.height_spin.value())
-            img_to_save = img_to_save.resize(new_size, Image.Resampling.LANCZOS)
-            self.progress_bar.setValue(40)
+            # Quality value
+            quality = self.quality_slider.value()
             
-            # Apply background removal if selected and format supports it
-            if self.remove_bg_check.isChecked() and REMBG_AVAILABLE and selected_format != "SVG":
-                self.statusBar().showMessage('Removing background...')
-                img_to_save = self.apply_background_removal(img_to_save)
-                self.statusBar().showMessage('Background removed')
-            self.progress_bar.setValue(80)
-            
-            # Save with appropriate format and options
-            if selected_format == "JPEG":
-                # JPEG doesn't support alpha, use white background
-                if img_to_save.mode == 'RGBA':
-                    white_bg = Image.new('RGBA', img_to_save.size, (255, 255, 255, 255))
-                    img_to_save = Image.alpha_composite(white_bg, img_to_save).convert('RGB')
-                img_to_save.save(file_path, quality=self.quality_slider.value())
-                
-            elif selected_format == "ICO":
-                # Create a list of sizes for the icon
-                sizes = []
-                if self.size_16.isChecked(): sizes.append((16, 16))
-                if self.size_32.isChecked(): sizes.append((32, 32))
-                if self.size_48.isChecked(): sizes.append((48, 48))
-                if self.size_64.isChecked(): sizes.append((64, 64))
-                if self.size_128.isChecked(): sizes.append((128, 128))
-                if self.size_256.isChecked(): sizes.append((256, 256))
-                
-                if not sizes:  # If no sizes selected, use default
-                    sizes = [(32, 32)]
-                
-                # Create images for each size
-                img_to_save.save(file_path, format="ICO", sizes=sizes)
-                
-            elif selected_format == "SVG":
-                # Use direct conversion with the specified quality
-                self.save_as_svg_direct(img_to_save, file_path, self.svg_quality_slider.value())
-                
+            # Check if we need to save as SVG
+            if ext == '.svg':
+                if SVGLIB_AVAILABLE:
+                    self.save_as_svg_direct(img_to_save, file_path, quality)
+                else:
+                    QMessageBox.warning(self, "SVG Support Not Available", 
+                                      "SVG export is not available because the required packages are not installed.\n\n"
+                                      "Click 'Install SVG Support' in the status panel.")
+                    return
             else:
-                img_to_save.save(file_path)
+                # Check if trying to save transparent image as JPEG
+                if (ext == '.jpg' or ext == '.jpeg') and img_to_save.mode == 'RGBA':
+                    # Warn the user that transparency will be lost
+                    msg = QMessageBox()
+                    msg.setIcon(QMessageBox.Warning)
+                    msg.setWindowTitle("Transparency Warning")
+                    msg.setText("JPEG format doesn't support transparency!")
+                    msg.setInformativeText("The transparent background will be replaced with white. Continue with JPEG or save as PNG instead?")
+                    
+                    # Add custom buttons
+                    continue_button = msg.addButton("Continue with JPEG", QMessageBox.YesRole)
+                    png_button = msg.addButton("Save as PNG instead", QMessageBox.NoRole)
+                    cancel_button = msg.addButton(QMessageBox.Cancel)
+                    
+                    msg.exec_()
+                    
+                    clicked_button = msg.clickedButton()
+                    
+                    if clicked_button == cancel_button:
+                        return
+                    elif clicked_button == png_button:
+                        # Change to PNG format
+                        ext = '.png'
+                        file_path = os.path.splitext(file_path)[0] + '.png'
+                        self.statusBar().showMessage(f"Changed format to PNG to preserve transparency")
+                
+                # Regular image save
+                if ext == '.jpg' or ext == '.jpeg':
+                    # Convert RGBA to RGB with white background for JPEG
+                    if img_to_save.mode == 'RGBA':
+                        # Create a white background
+                        background = Image.new('RGB', img_to_save.size, (255, 255, 255))
+                        # Paste the image using alpha as mask
+                        background.paste(img_to_save, mask=img_to_save.split()[3])
+                        img_to_save = background
+                    # Make sure the image is in RGB mode
+                    elif img_to_save.mode != 'RGB':
+                        img_to_save = img_to_save.convert('RGB')
+                        
+                    img_to_save.save(file_path, format="JPEG", quality=quality)
+                    
+                elif ext == '.png':
+                    # Ensure mode is RGBA if it has transparency
+                    if 'A' in img_to_save.mode or img_to_save.mode == 'RGBA':
+                        img_to_save = img_to_save.convert('RGBA')
+                    img_to_save.save(file_path, format="PNG")
+                else:
+                    # Default to PNG for unknown formats
+                    img_to_save.save(file_path, format="PNG")
+                    
+            self.statusBar().showMessage(f"Image saved to {file_path}")
+            logger.info(f"Image saved to: {file_path} in mode {img_to_save.mode}")
             
-            self.progress_bar.setValue(100)
-            QMessageBox.information(self, "Success", f"Image saved as {os.path.basename(file_path)}")
-            
-            # Reset progress bar after a delay
-            QTimer.singleShot(1500, lambda: self.progress_bar.setValue(0))
         except Exception as e:
-            self.progress_bar.setValue(0)
-            QMessageBox.critical(self, "Error", f"Failed to save image: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            QMessageBox.critical(self, "Save Error", f"Failed to save image: {str(e)}")
+            logger.error(f"Save error: {str(e)}")
+            logger.error(traceback.format_exc())
     
     def save_as_svg_direct(self, img, file_path, quality=85):
         """Convert image to SVG using direct embedding."""
@@ -1193,6 +1231,211 @@ class ImageEditorApp(QMainWindow):
             QMessageBox.critical(self, "Installation Error", 
                                f"Failed to install SVG dependencies: {str(e)}\n\nCheck the log file for details.")
             logger.error(f"Installation error: {str(e)}")
+            logger.error(traceback.format_exc())
+
+    # Add new methods for undo/redo functionality
+    def save_state(self):
+        """Save current state to history"""
+        if self.current_image is None:
+            return
+            
+        # If we're not at the end of the history, truncate it
+        if self.history_position < len(self.history) - 1:
+            self.history = self.history[:self.history_position + 1]
+            
+        # Create a copy of the current image
+        state = {
+            'image': self.current_image.copy(),
+            'width': self.width_spin.value(),
+            'height': self.height_spin.value()
+        }
+        
+        # Add to history
+        self.history.append(state)
+        
+        # Enforce history limit
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+        else:
+            self.history_position = len(self.history) - 1
+            
+        # Enable/disable undo/redo buttons
+        self.update_undo_redo_buttons()
+        
+    def update_undo_redo_buttons(self):
+        """Update the enabled state of undo/redo buttons"""
+        self.undo_action.setEnabled(self.history_position >= 0)
+        self.redo_action.setEnabled(self.history_position < len(self.history) - 1)
+        
+    def undo(self):
+        """Undo the last operation"""
+        if self.history_position > 0:
+            self.history_position -= 1
+            self.restore_state(self.history[self.history_position])
+            self.update_undo_redo_buttons()
+            
+    def redo(self):
+        """Redo the last undone operation"""
+        if self.history_position < len(self.history) - 1:
+            self.history_position += 1
+            self.restore_state(self.history[self.history_position])
+            self.update_undo_redo_buttons()
+            
+    def restore_state(self, state):
+        """Restore a saved state"""
+        self.current_image = state['image'].copy()
+        
+        # Block signals to prevent recursive updates
+        self.width_spin.blockSignals(True)
+        self.height_spin.blockSignals(True)
+        
+        # Restore width and height
+        self.width_spin.setValue(state['width'])
+        self.height_spin.setValue(state['height'])
+        
+        # Unblock signals
+        self.width_spin.blockSignals(False)
+        self.height_spin.blockSignals(False)
+        
+        # Display the restored image
+        self.display_pil_image(self.current_image)
+
+    def display_pil_image(self, pil_image):
+        """Display a PIL image in the UI"""
+        if pil_image is None:
+            return
+            
+        # Convert PIL image to QPixmap and display
+        # Need to handle conversion differently to avoid type errors
+        if pil_image.mode == "RGBA":
+            # For RGBA images, we need to preserve transparency
+            data = pil_image.tobytes("raw", "RGBA")
+            qimage = QImage(data, pil_image.width, pil_image.height, QImage.Format_RGBA8888)
+        else:
+            # For other formats, convert to RGB first
+            rgb_img = pil_image.convert("RGB")
+            data = rgb_img.tobytes("raw", "RGB")
+            qimage = QImage(data, rgb_img.width, rgb_img.height, QImage.Format_RGB888)
+            
+        pixmap = QPixmap.fromImage(qimage)
+        
+        # Scale pixmap to fit label while maintaining aspect ratio
+        scaled_pixmap = pixmap.scaled(
+            self.image_label.width(),
+            self.image_label.height(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        self.image_label.setPixmap(scaled_pixmap)
+
+    def show_welcome_dialog(self):
+        """Show a welcome dialog with information about new features."""
+        welcome_msg = QMessageBox(self)
+        welcome_msg.setWindowTitle("Welcome to Image Editor")
+        welcome_msg.setIcon(QMessageBox.Information)
+        welcome_msg.setText("Welcome to the improved Image Editor!")
+        
+        # Add information about new features
+        features_text = """
+<b>Features:</b>
+<ul>
+<li><b>NEW!</b> Drag and Drop Support - Drag image files directly into the editor</li>
+<li>Independent width/height control - aspect ratio is now OFF by default</li>
+<li>Dark/Light mode toggle in the toolbar</li>
+<li>Undo/Redo support for all editing operations</li>
+<li>Keyboard shortcuts:</li>
+    <ul>
+    <li>Ctrl+O: Open image</li>
+    <li>Ctrl+S: Save image</li>
+    <li>Ctrl+Z: Undo</li>
+    <li>Ctrl+Y: Redo</li>
+    <li>Ctrl+P: Apply Changes</li>
+    <li>Ctrl+B: Remove Background</li>
+    </ul>
+</ul>
+"""
+        welcome_msg.setInformativeText(features_text)
+        welcome_msg.setStandardButtons(QMessageBox.Ok)
+        welcome_msg.exec_()
+
+    # Add drag and drop event handlers
+    def dragEnterEvent(self, event):
+        """Accept drag events if they contain image files."""
+        # Check if the drag contains URLs (files)
+        if event.mimeData().hasUrls():
+            # Get the first URL
+            url = event.mimeData().urls()[0]
+            # Check if it's a local file
+            if url.isLocalFile():
+                file_path = url.toLocalFile()
+                # Check if it's an image file by extension
+                if file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif', '.webp')):
+                    # Add visual feedback
+                    self.image_label.setStyleSheet(
+                        "border: 3px dashed #007ACC; background-color: rgba(0, 122, 204, 0.1);"
+                    )
+                    event.acceptProposedAction()
+                    return
+        # If not an image file, don't accept
+        event.ignore()
+    
+    def dragMoveEvent(self, event):
+        """Allow the drag to move over the window."""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def dragLeaveEvent(self, event):
+        """Reset the visual feedback when drag leaves."""
+        # Reset the image label style
+        bg_color = "#1E1E1E" if self.is_dark_mode else "#FFFFFF"
+        self.image_label.setStyleSheet(f"border: 2px dashed #555555; background-color: {bg_color};")
+        event.accept()
+    
+    def dropEvent(self, event):
+        """Handle the dropped file."""
+        # Reset the visual style first
+        bg_color = "#1E1E1E" if self.is_dark_mode else "#FFFFFF"
+        self.image_label.setStyleSheet(f"border: 2px dashed #555555; background-color: {bg_color};")
+        
+        if event.mimeData().hasUrls():
+            # Get the first URL
+            url = event.mimeData().urls()[0]
+            # If it's a local file
+            if url.isLocalFile():
+                file_path = url.toLocalFile()
+                # Check if it's an image file
+                if file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif', '.webp')):
+                    # Load the image
+                    self.load_image_from_path(file_path)
+                    event.acceptProposedAction()
+                    
+                    # Show a status message
+                    self.statusBar().showMessage(f"Image loaded from drag and drop: {os.path.basename(file_path)}")
+                    return
+        # If not an image file, don't accept
+        event.ignore()
+    
+    # Add method to load image from path 
+    def load_image_from_path(self, file_path):
+        """Load an image from a file path."""
+        try:
+            self.current_image_path = file_path
+            self.current_image = Image.open(file_path)
+            self.original_size = self.current_image.size
+            
+            # Update spinboxes with image dimensions
+            self.width_spin.setValue(self.original_size[0])
+            self.height_spin.setValue(self.original_size[1])
+            
+            # Display image
+            self.display_image(file_path)
+            self.info_label.setText(f"Size: {self.original_size[0]}x{self.original_size[1]}")
+            self.statusBar().showMessage(f'Loaded: {os.path.basename(file_path)}')
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not load image: {str(e)}")
+            logger.error(f"Error loading image: {str(e)}")
             logger.error(traceback.format_exc())
 
 def main():

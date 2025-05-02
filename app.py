@@ -146,6 +146,182 @@ class TransparentBackgroundLabel(QLabel):
         painter.end()
         super().paintEvent(event)
 
+class ZoomableImageLabel(TransparentBackgroundLabel):
+    """Extended QLabel that supports zooming and panning."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.original_pixmap = None
+        self.current_pixmap = None
+        self.zoom_factor = 1.0
+        self.zoom_step = 0.1  # 10% zoom per step
+        self.min_zoom = 0.1   # Minimum zoom level (10%)
+        self.max_zoom = 5.0   # Maximum zoom level (500%)
+        
+        # For panning support
+        self.panning = False
+        self.pan_start_x = 0
+        self.pan_start_y = 0
+        self.pan_offset_x = 0
+        self.pan_offset_y = 0
+        
+        # Enable mouse tracking
+        self.setMouseTracking(True)
+        
+        # Allow focus to receive key events
+        self.setFocusPolicy(Qt.StrongFocus)
+        
+    def setPixmap(self, pixmap):
+        """Override setPixmap to store the original for zooming."""
+        if pixmap and not pixmap.isNull():
+            self.original_pixmap = pixmap
+            self.current_pixmap = pixmap
+            self.zoom_factor = 1.0
+            self.pan_offset_x = 0
+            self.pan_offset_y = 0
+            self.update_display()
+        else:
+            super().setPixmap(pixmap)
+    
+    def update_display(self):
+        """Update the displayed image with current zoom and pan settings."""
+        if self.original_pixmap and not self.original_pixmap.isNull():
+            # Calculate scaled size
+            new_width = int(self.original_pixmap.width() * self.zoom_factor)
+            new_height = int(self.original_pixmap.height() * self.zoom_factor)
+            
+            # Scale the pixmap
+            if new_width > 0 and new_height > 0:
+                scaled_pixmap = self.original_pixmap.scaled(
+                    new_width, 
+                    new_height,
+                    Qt.KeepAspectRatio, 
+                    Qt.SmoothTransformation
+                )
+                
+                self.current_pixmap = scaled_pixmap
+                super().setPixmap(scaled_pixmap)
+    
+    def update_cursor(self):
+        """Update cursor based on current state."""
+        if self.panning:
+            self.setCursor(Qt.ClosedHandCursor)  # Grabbing hand
+        else:
+            self.setCursor(Qt.OpenHandCursor)    # Hand for panning
+    
+    def zoom_in(self):
+        """Zoom in by one step."""
+        if self.original_pixmap and not self.original_pixmap.isNull():
+            old_zoom = self.zoom_factor
+            self.zoom_factor = min(self.zoom_factor + self.zoom_step, self.max_zoom)
+            if old_zoom != self.zoom_factor:
+                self.update_display()
+                self.update_cursor()
+                return True
+        return False
+    
+    def zoom_out(self):
+        """Zoom out by one step."""
+        if self.original_pixmap and not self.original_pixmap.isNull():
+            old_zoom = self.zoom_factor
+            self.zoom_factor = max(self.zoom_factor - self.zoom_step, self.min_zoom)
+            if old_zoom != self.zoom_factor:
+                self.update_display()
+                self.update_cursor()
+                return True
+        return False
+    
+    def reset_zoom(self):
+        """Reset zoom to 100%."""
+        if self.original_pixmap and not self.original_pixmap.isNull():
+            old_zoom = self.zoom_factor
+            self.zoom_factor = 1.0
+            self.pan_offset_x = 0
+            self.pan_offset_y = 0
+            if old_zoom != self.zoom_factor:
+                self.update_display()
+                self.update_cursor()
+                return True
+        return False
+    
+    # Mouse event handlers for zooming and panning
+    def wheelEvent(self, event):
+        """Handle mouse wheel events for zooming."""
+        if self.original_pixmap and not self.original_pixmap.isNull():
+            # Get the angle delta
+            delta = event.angleDelta().y()
+            
+            # Zoom in or out based on wheel direction
+            if delta > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+    
+    def mousePressEvent(self, event):
+        """Handle mouse press for panning."""
+        if event.button() == Qt.LeftButton:
+            # Allow panning at any zoom level (not just when zoomed in)
+            self.panning = True
+            self.pan_start_x = event.x()
+            self.pan_start_y = event.y()
+            self.update_cursor()
+    
+    def mouseMoveEvent(self, event):
+        """Handle mouse move for panning."""
+        if self.panning:
+            # Calculate movement delta
+            delta_x = event.x() - self.pan_start_x
+            delta_y = event.y() - self.pan_start_y
+            
+            # Update panning offset
+            self.pan_offset_x += delta_x
+            self.pan_offset_y += delta_y
+            
+            # Reset start position
+            self.pan_start_x = event.x()
+            self.pan_start_y = event.y()
+            
+            # Update the display with new offset
+            self.update()
+    
+    def mouseReleaseEvent(self, event):
+        """Handle mouse release to end panning."""
+        if event.button() == Qt.LeftButton and self.panning:
+            self.panning = False
+            self.update_cursor()
+    
+    def paintEvent(self, event):
+        """Custom paint event to handle panning."""
+        if self.current_pixmap and not self.current_pixmap.isNull():
+            painter = QPainter(self)
+            
+            # Draw the checkered background first (for transparent images)
+            if self.dark_mode:
+                color1 = QColor(50, 50, 50)  # Dark gray
+                color2 = QColor(70, 70, 70)  # Medium gray
+            else:
+                color1 = QColor(240, 240, 240)  # Light gray 
+                color2 = QColor(255, 255, 255)  # White
+            
+            # Draw checkered background for transparent images
+            size = 10  # Size of each checker square
+            for i in range(0, self.width(), size):
+                for j in range(0, self.height(), size):
+                    rect = QRect(i, j, size, size)
+                    if (i // size + j // size) % 2 == 0:
+                        painter.fillRect(rect, color1)
+                    else:
+                        painter.fillRect(rect, color2)
+            
+            # Calculate position to center the image in the view
+            x = (self.width() - self.current_pixmap.width()) / 2 + self.pan_offset_x
+            y = (self.height() - self.current_pixmap.height()) / 2 + self.pan_offset_y
+            
+            # Draw the pixmap with panning offset
+            painter.drawPixmap(int(x), int(y), self.current_pixmap)
+        else:
+            # Fall back to default paint behavior for normal display
+            super().paintEvent(event)
+
 class BackgroundRemovalThread(QThread):
     """Thread for background removal to prevent UI freezing."""
     finished = pyqtSignal(object)
@@ -262,6 +438,25 @@ class ImageEditorApp(QMainWindow):
         # Add separator in toolbar
         self.toolbar.addSeparator()
         
+        # Add zoom controls to toolbar
+        self.zoom_in_action = QAction("Zoom In", self)
+        self.zoom_in_action.setShortcut(QKeySequence("Ctrl++"))  # Ctrl+Plus
+        self.zoom_in_action.triggered.connect(self.zoom_in_action_triggered)
+        self.toolbar.addAction(self.zoom_in_action)
+        
+        self.zoom_out_action = QAction("Zoom Out", self)
+        self.zoom_out_action.setShortcut(QKeySequence("Ctrl+-"))  # Ctrl+Minus
+        self.zoom_out_action.triggered.connect(self.zoom_out_action_triggered)
+        self.toolbar.addAction(self.zoom_out_action)
+        
+        self.zoom_reset_action = QAction("Reset Zoom", self)
+        self.zoom_reset_action.setShortcut(QKeySequence("Ctrl+0"))  # Ctrl+0
+        self.zoom_reset_action.triggered.connect(self.zoom_reset_action_triggered)
+        self.toolbar.addAction(self.zoom_reset_action)
+        
+        # Add separator in toolbar
+        self.toolbar.addSeparator()
+        
         # Set appropriate style based on dark mode
         if self.is_dark_mode:
             self.setStyleSheet("""
@@ -369,7 +564,7 @@ class ImageEditorApp(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
         
         # Image display area - Use custom label for transparent images
-        self.image_label = TransparentBackgroundLabel("No image loaded")
+        self.image_label = ZoomableImageLabel("No image loaded")
         self.image_label.set_dark_mode(self.is_dark_mode)
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(400, 300)
@@ -377,6 +572,11 @@ class ImageEditorApp(QMainWindow):
         self.image_label.setStyleSheet(f"border: 2px dashed #555555; background-color: {bg_color};")
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_layout.addWidget(self.image_label)
+        
+        # Add zoom info label below the image
+        self.zoom_info_label = QLabel("Zoom: 100%")
+        self.zoom_info_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.zoom_info_label)
         
         # Control panels
         controls_layout = QHBoxLayout()
@@ -391,6 +591,26 @@ class ImageEditorApp(QMainWindow):
         # Image info
         self.info_label = QLabel("Size: N/A")
         load_layout.addWidget(self.info_label)
+        
+        # Add zoom controls to the load panel
+        zoom_layout = QHBoxLayout()
+        self.zoom_in_btn = QPushButton("Zoom In")
+        self.zoom_in_btn.clicked.connect(self.zoom_in_action_triggered)
+        self.zoom_in_btn.setToolTip("Zoom in (Ctrl++)")
+        
+        self.zoom_out_btn = QPushButton("Zoom Out")
+        self.zoom_out_btn.clicked.connect(self.zoom_out_action_triggered)
+        self.zoom_out_btn.setToolTip("Zoom out (Ctrl+-)")
+        
+        self.zoom_reset_btn = QPushButton("Reset Zoom")
+        self.zoom_reset_btn.clicked.connect(self.zoom_reset_action_triggered)
+        self.zoom_reset_btn.setToolTip("Reset zoom to 100% (Ctrl+0)")
+        
+        zoom_layout.addWidget(self.zoom_in_btn)
+        zoom_layout.addWidget(self.zoom_out_btn)
+        load_layout.addLayout(zoom_layout)
+        load_layout.addWidget(self.zoom_reset_btn)
+        
         controls_layout.addWidget(load_group)
         
         # Resize panel
@@ -436,6 +656,63 @@ class ImageEditorApp(QMainWindow):
         resize_layout.addWidget(self.preview_btn)
         
         controls_layout.addWidget(resize_group)
+        
+        # Add Transform panel for rotation and flipping
+        transform_group = QGroupBox("Transform")
+        transform_layout = QVBoxLayout(transform_group)
+        
+        # Rotation buttons
+        rotation_layout = QHBoxLayout()
+        self.rotate_90_btn = QPushButton("Rotate 90°")
+        self.rotate_90_btn.clicked.connect(lambda: self.rotate_image(90))
+        self.rotate_90_btn.setToolTip("Rotate image 90 degrees clockwise")
+        
+        self.rotate_180_btn = QPushButton("Rotate 180°")
+        self.rotate_180_btn.clicked.connect(lambda: self.rotate_image(180))
+        self.rotate_180_btn.setToolTip("Rotate image 180 degrees")
+        
+        self.rotate_270_btn = QPushButton("Rotate 270°")
+        self.rotate_270_btn.clicked.connect(lambda: self.rotate_image(270))
+        self.rotate_270_btn.setToolTip("Rotate image 270 degrees clockwise (90 degrees counterclockwise)")
+        
+        rotation_layout.addWidget(self.rotate_90_btn)
+        rotation_layout.addWidget(self.rotate_180_btn)
+        rotation_layout.addWidget(self.rotate_270_btn)
+        transform_layout.addLayout(rotation_layout)
+        
+        # Fine rotation arrows
+        fine_rotation_layout = QHBoxLayout()
+        fine_rotation_layout.addWidget(QLabel("Fine Rotation:"))
+        
+        self.rotate_left_btn = QPushButton("↺")  # Counter-clockwise arrow
+        self.rotate_left_btn.clicked.connect(lambda: self.rotate_image_fine(-5))
+        self.rotate_left_btn.setToolTip("Rotate 5° counter-clockwise")
+        self.rotate_left_btn.setMaximumWidth(40)
+        
+        self.rotate_right_btn = QPushButton("↻")  # Clockwise arrow
+        self.rotate_right_btn.clicked.connect(lambda: self.rotate_image_fine(5))
+        self.rotate_right_btn.setToolTip("Rotate 5° clockwise")
+        self.rotate_right_btn.setMaximumWidth(40)
+        
+        fine_rotation_layout.addWidget(self.rotate_left_btn)
+        fine_rotation_layout.addWidget(self.rotate_right_btn)
+        transform_layout.addLayout(fine_rotation_layout)
+        
+        # Flip buttons
+        flip_layout = QHBoxLayout()
+        self.flip_h_btn = QPushButton("Flip Horizontal")
+        self.flip_h_btn.clicked.connect(lambda: self.flip_image("horizontal"))
+        self.flip_h_btn.setToolTip("Flip image horizontally (mirror)")
+        
+        self.flip_v_btn = QPushButton("Flip Vertical")
+        self.flip_v_btn.clicked.connect(lambda: self.flip_image("vertical"))
+        self.flip_v_btn.setToolTip("Flip image vertically (upside down)")
+        
+        flip_layout.addWidget(self.flip_h_btn)
+        flip_layout.addWidget(self.flip_v_btn)
+        transform_layout.addLayout(flip_layout)
+        
+        controls_layout.addWidget(transform_group)
         
         # Background removal
         bg_group = QGroupBox("Background Removal")
@@ -1339,6 +1616,8 @@ class ImageEditorApp(QMainWindow):
         features_text = """
 <b>Features:</b>
 <ul>
+<li><b>NEW!</b> Image Rotation and Flipping - Rotate or flip your images with one click</li>
+<li><b>NEW!</b> Zoom and Pan - Zoom with mouse wheel or Ctrl+/- and pan by dragging</li>
 <li><b>NEW!</b> Drag and Drop Support - Drag image files directly into the editor</li>
 <li>Independent width/height control - aspect ratio is now OFF by default</li>
 <li>Dark/Light mode toggle in the toolbar</li>
@@ -1351,6 +1630,9 @@ class ImageEditorApp(QMainWindow):
     <li>Ctrl+Y: Redo</li>
     <li>Ctrl+P: Apply Changes</li>
     <li>Ctrl+B: Remove Background</li>
+    <li>Ctrl++: Zoom in</li>
+    <li>Ctrl+-: Zoom out</li>
+    <li>Ctrl+0: Reset zoom</li>
     </ul>
 </ul>
 """
@@ -1436,6 +1718,138 @@ class ImageEditorApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not load image: {str(e)}")
             logger.error(f"Error loading image: {str(e)}")
+            logger.error(traceback.format_exc())
+
+    def rotate_image(self, degrees):
+        """Rotate the image by the specified degrees."""
+        if self.current_image is None:
+            QMessageBox.warning(self, "Warning", "No image to rotate!")
+            return
+            
+        # Save current state for undo/redo
+        self.save_state()
+        
+        try:
+            # Rotate the image
+            rotated_image = self.current_image.rotate(degrees, expand=True, resample=Image.Resampling.BICUBIC)
+            
+            # Update current image
+            self.current_image = rotated_image
+            
+            # Update the display
+            self.display_pil_image(self.current_image)
+            
+            # Update size info since rotation might change dimensions
+            self.width_spin.setValue(self.current_image.width)
+            self.height_spin.setValue(self.current_image.height)
+            self.info_label.setText(f"Size: {self.current_image.width}x{self.current_image.height}")
+            
+            # Update status
+            self.statusBar().showMessage(f"Image rotated {degrees} degrees")
+            logger.info(f"Image rotated {degrees} degrees")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to rotate image: {str(e)}")
+            logger.error(f"Rotation error: {str(e)}")
+            logger.error(traceback.format_exc())
+    
+    def flip_image(self, direction):
+        """Flip the image horizontally or vertically."""
+        if self.current_image is None:
+            QMessageBox.warning(self, "Warning", "No image to flip!")
+            return
+            
+        # Save current state for undo/redo
+        self.save_state()
+        
+        try:
+            if direction == "horizontal":
+                # Flip the image horizontally (left to right)
+                flipped_image = self.current_image.transpose(Image.FLIP_LEFT_RIGHT)
+                flip_desc = "horizontally"
+            else:  # vertical
+                # Flip the image vertically (top to bottom)
+                flipped_image = self.current_image.transpose(Image.FLIP_TOP_BOTTOM)
+                flip_desc = "vertically"
+            
+            # Update current image
+            self.current_image = flipped_image
+            
+            # Update the display
+            self.display_pil_image(self.current_image)
+            
+            # Update status
+            self.statusBar().showMessage(f"Image flipped {flip_desc}")
+            logger.info(f"Image flipped {flip_desc}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to flip image: {str(e)}")
+            logger.error(f"Flip error: {str(e)}")
+            logger.error(traceback.format_exc())
+
+    def zoom_in_action_triggered(self):
+        """Handler for zoom in button and shortcut."""
+        if self.image_label.zoom_in():
+            # Update the zoom info label
+            zoom_percent = int(self.image_label.zoom_factor * 100)
+            self.zoom_info_label.setText(f"Zoom: {zoom_percent}%")
+            self.statusBar().showMessage(f"Zoomed in to {zoom_percent}%")
+    
+    def zoom_out_action_triggered(self):
+        """Handler for zoom out button and shortcut."""
+        if self.image_label.zoom_out():
+            # Update the zoom info label
+            zoom_percent = int(self.image_label.zoom_factor * 100)
+            self.zoom_info_label.setText(f"Zoom: {zoom_percent}%")
+            self.statusBar().showMessage(f"Zoomed out to {zoom_percent}%")
+    
+    def zoom_reset_action_triggered(self):
+        """Handler for zoom reset button and shortcut."""
+        if self.image_label.reset_zoom():
+            # Update the zoom info label
+            self.zoom_info_label.setText("Zoom: 100%")
+            self.statusBar().showMessage("Zoom reset to 100%")
+
+    def rotate_image_fine(self, degrees):
+        """Rotate the image by a small angle without changing its size."""
+        if self.current_image is None:
+            QMessageBox.warning(self, "Warning", "No image to rotate!")
+            return
+            
+        # Save current state for undo/redo
+        self.save_state()
+        
+        try:
+            # Get original dimensions
+            original_width, original_height = self.current_image.size
+            
+            # For fine rotations, don't expand the canvas to keep the original dimensions
+            rotated_image = self.current_image.rotate(degrees, expand=False, resample=Image.Resampling.BICUBIC)
+            
+            # Ensure we maintain original dimensions (may crop some edges for non-rectangular images)
+            if rotated_image.size != (original_width, original_height):
+                # Create a new image with original dimensions
+                new_image = Image.new(rotated_image.mode, (original_width, original_height), (0, 0, 0, 0))
+                
+                # Calculate paste position to center the rotated image
+                paste_x = (original_width - rotated_image.width) // 2
+                paste_y = (original_height - rotated_image.height) // 2
+                
+                # Paste the rotated image
+                new_image.paste(rotated_image, (paste_x, paste_y))
+                rotated_image = new_image
+            
+            # Update current image
+            self.current_image = rotated_image
+            
+            # Update the display
+            self.display_pil_image(self.current_image)
+            
+            # Use appropriate sign for status message
+            sign = "+" if degrees > 0 else ""
+            self.statusBar().showMessage(f"Fine rotation: {sign}{degrees}°")
+            logger.info(f"Fine rotation: {sign}{degrees} degrees")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to rotate image: {str(e)}")
+            logger.error(f"Fine rotation error: {str(e)}")
             logger.error(traceback.format_exc())
 
 def main():
